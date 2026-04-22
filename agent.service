@@ -1,0 +1,43 @@
+[Unit]
+Description=ClickHouse Analytics Agent (LangGraph + FastAPI)
+Documentation=https://github.com/Erofaxxx/magnetto_agent_v1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+WorkingDirectory=/root/clickhouse_analytics_agent
+
+# Load .env so OPENROUTER_API_KEY, CLICKHOUSE_* etc. are available
+EnvironmentFile=/root/clickhouse_analytics_agent/.env
+
+# Start uvicorn using the project's venv
+ExecStart=/root/clickhouse_analytics_agent/venv/bin/uvicorn \
+    api_server:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --log-level info \
+    --no-access-log
+
+# Restart on crash, with backoff
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Resource limits
+# Increase if you handle many concurrent sessions
+LimitNOFILE=65536
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging — read with: journalctl -u analytics-agent -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=analytics-agent
+
+[Install]
+WantedBy=multi-user.target
