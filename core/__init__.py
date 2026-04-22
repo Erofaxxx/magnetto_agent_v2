@@ -1,5 +1,5 @@
 """
-Deep Agents v2 core — фабрики, middleware, инструменты.
+Deep Agents core — фабрики, middleware, инструменты.
 
 Architecture:
   - agent_factory.build_agent(session_id, client_id) → CompiledStateGraph

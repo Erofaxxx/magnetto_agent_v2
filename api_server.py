@@ -32,8 +32,8 @@ from pydantic import BaseModel
 load_dotenv()
 from config import ALLOWED_MODELS, HOST, MODEL, PORT, SERVER_URL
 
-# ─── deepagents v2 switch ────────────────────────────────────────────────────
-# When USE_DEEPAGENTS=1, requests are routed through core_v2.api_adapter
+# ─── deepagents switch ────────────────────────────────────────────────────
+# When USE_DEEPAGENTS=1, requests are routed through core.api_adapter
 # (new deepagents-based agent). Otherwise — legacy agent.AnalyticsAgent.
 import os as _os
 _USE_DEEPAGENTS = _os.environ.get("USE_DEEPAGENTS", "0") in ("1", "true", "True", "yes")
@@ -123,7 +123,7 @@ async def _run_agent_job(job_id: str) -> None:
     started_at = datetime.now(timezone.utc).isoformat()
     try:
         if _USE_DEEPAGENTS:
-            from core_v2.api_adapter import analyze_deepagents
+            from core.api_adapter import analyze_deepagents
             result = await asyncio.to_thread(
                 analyze_deepagents,
                 query=job["query"],
@@ -203,14 +203,14 @@ async def _cleanup_loop() -> None:
 async def startup() -> None:
     if _USE_DEEPAGENTS:
         # Warm up: schema cache + agent factory build one agent for default model.
-        from core_v2.agent_factory import build_agent
+        from core.agent_factory import build_agent
         await asyncio.to_thread(build_agent, "magnetto", MODEL)
-        print("✅ deepagents v2 ready (USE_DEEPAGENTS=1)")
+        print("✅ deepagents ready (USE_DEEPAGENTS=1)")
     else:
         from agent import get_agent
         get_agent()
     asyncio.create_task(_cleanup_loop())
-    print(f"✅ ClickHouse Analytics Agent API v2 started | {SERVER_URL}")
+    print(f"✅ ClickHouse Analytics Agent API started | {SERVER_URL}")
 
 
 # ─── Session files endpoint (deepagents only) ─────────────────────────────────

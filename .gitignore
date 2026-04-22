@@ -25,6 +25,6 @@ chat_history.db-wal
 *.swp
 
 # Additional
-venv_v2/
 *.bak
 *.bak_*
+venv_v2/

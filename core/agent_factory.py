@@ -45,7 +45,7 @@ _MAX_ITERATIONS = int(os.environ.get("MAX_AGENT_ITERATIONS", "30"))
 
 _OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://server.asktab.ru",
-    "X-Title": "Magnetto Analytics Agent v2 (deepagents)",
+    "X-Title": "Magnetto Analytics Agent (deepagents)",
 }
 
 

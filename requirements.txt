@@ -1,6 +1,4 @@
 # Requirements for deepagents-based agent (USE_DEEPAGENTS=1).
-# Install into a separate venv with Python 3.11+ (e.g. venv_v2).
-# The legacy agent keeps using its own venv with Python 3.10.
 
 # ─── DeepAgents + LangChain 1.x ───────────────────────────────────────────────
 deepagents>=0.5.3                     # main framework
