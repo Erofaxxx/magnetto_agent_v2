@@ -1,0 +1,36 @@
+[Unit]
+Description=ClickHouse Analytics Agent (deepagents + FastAPI)
+Documentation=https://github.com/Erofaxxx/magnetto_agent_v2
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+WorkingDirectory=/root/clickhouse_analytics_agent/agent
+EnvironmentFile=/root/clickhouse_analytics_agent/agent/.env
+
+ExecStart=/root/clickhouse_analytics_agent/venv/bin/uvicorn \
+    api_server:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --log-level info \
+    --no-access-log
+
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+LimitNOFILE=65536
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=analytics-agent
+
+[Install]
+WantedBy=multi-user.target

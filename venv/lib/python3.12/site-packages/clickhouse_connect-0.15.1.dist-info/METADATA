@@ -1,0 +1,124 @@
+Metadata-Version: 2.4
+Name: clickhouse-connect
+Version: 0.15.1
+Summary: ClickHouse Database Core Driver for Python, Pandas, and Superset
+Home-page: https://github.com/ClickHouse/clickhouse-connect
+Author: ClickHouse Inc.
+Author-email: clients@clickhouse.com
+License: Apache License 2.0
+Keywords: clickhouse,superset,sqlalchemy,http,driver
+Classifier: Development Status :: 4 - Beta
+Classifier: Intended Audience :: Developers
+Classifier: License :: OSI Approved :: Apache Software License
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Requires-Python: >=3.9,<3.15
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: certifi
+Requires-Dist: urllib3>=1.26
+Requires-Dist: pytz
+Requires-Dist: zstandard; python_version < "3.14"
+Requires-Dist: zstandard>=0.25.0; python_version >= "3.14"
+Requires-Dist: lz4; python_version < "3.14"
+Requires-Dist: lz4>=4.4.5; python_version >= "3.14"
+Provides-Extra: sqlalchemy
+Requires-Dist: sqlalchemy<3.0,>=1.4.40; extra == "sqlalchemy"
+Provides-Extra: numpy
+Requires-Dist: numpy; extra == "numpy"
+Provides-Extra: pandas
+Requires-Dist: pandas<3; extra == "pandas"
+Provides-Extra: polars
+Requires-Dist: polars>=1.0; extra == "polars"
+Provides-Extra: arrow
+Requires-Dist: pyarrow>=22.0; python_version >= "3.14" and extra == "arrow"
+Requires-Dist: pyarrow; python_version < "3.14" and extra == "arrow"
+Provides-Extra: orjson
+Requires-Dist: orjson; extra == "orjson"
+Provides-Extra: tzlocal
+Requires-Dist: tzlocal>=4.0; extra == "tzlocal"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: description-content-type
+Dynamic: home-page
+Dynamic: keywords
+Dynamic: license
+Dynamic: license-file
+Dynamic: provides-extra
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
+
+## ClickHouse Connect
+
+A high performance core database driver for connecting ClickHouse to Python, Pandas, and Superset
+
+* Pandas DataFrames (numpy and arrow-backed). Pandas 2.x and above only, 1.x is deprecated and will be dropped in 1.0.
+* Numpy Arrays
+* PyArrow Tables
+* Polars DataFrames
+* Superset Connector
+* SQLAlchemy Core (select, joins, lightweight deletes; limited feature set)
+
+ClickHouse Connect currently uses the ClickHouse HTTP interface for maximum compatibility.
+
+### Installation
+
+```
+pip install clickhouse-connect
+```
+
+ClickHouse Connect requires Python 3.9 or higher. We officially test against Python 3.10 through 3.14.
+Python 3.9 is deprecated and support will be removed entirely in 1.0.
+
+### Superset Connectivity
+
+ClickHouse Connect is fully integrated with Apache Superset. Previous versions of ClickHouse Connect utilized a
+dynamically loaded Superset Engine Spec, but as of Superset v2.1.0 the engine spec was incorporated into the main
+Apache Superset project and removed from clickhouse-connect in v0.6.0. If you have issues connecting to earlier
+versions of Superset, please use clickhouse-connect v0.5.25.
+
+When creating a Superset Data Source, either use the provided connection dialog, or a SqlAlchemy DSN in the form
+`clickhousedb://{username}:{password}@{host}:{port}`.
+
+### SQLAlchemy Implementation
+
+ClickHouse Connect includes a lightweight SQLAlchemy dialect implementation focused on compatibility with **Superset**
+and **SQLAlchemy Core**. Both SQLAlchemy 1.4 and 2.x are supported. SQLAlchemy 1.4 compatibility is maintained
+because Apache Superset currently requires `sqlalchemy>=1.4,<2`.
+
+Supported features include:
+- Basic query execution via SQLAlchemy Core
+- `SELECT` queries with `JOIN`s (including ClickHouse-specific strictness, `USING`, and `GLOBAL` modifiers),
+  `ARRAY JOIN` (single and multi-column), `FINAL`, and `SAMPLE`
+- `VALUES` table function syntax
+- Lightweight `DELETE` statements
+
+A small number of features require SQLAlchemy 2.x: `Values.cte()` and certain literal-rendering behaviors.
+All other dialect features, including those used by Superset, work on both 1.4 and 2.x.
+
+Basic ORM usage works for insert-heavy, read-focused workloads: declarative model definitions, `CREATE TABLE`,
+`session.add()`, `bulk_save_objects()`, and read queries all function correctly. However, full ORM support is not
+provided. UPDATE compilation, foreign key/relationship reflection, autoincrement/RETURNING, and cascade operations
+are not implemented. The dialect is best suited for SQLAlchemy Core usage and Superset connectivity.
+
+### Asyncio Support
+
+ClickHouse Connect provides an `AsyncClient` for use in `asyncio` environments.
+See the [run_async example](./examples/run_async.py) for more details.
+
+The current `AsyncClient` is a thread-pool executor wrapper around the synchronous client and is deprecated.
+In 1.0.0 it will be replaced by a fully native async implementation. The API surface is the same,
+with one difference: you will no longer be able to create a sync client first and pass it to the
+`AsyncClient` constructor. Instead, use `clickhouse_connect.get_async_client()` directly.
+
+### Complete Documentation
+
+The documentation for ClickHouse Connect has moved to
+[ClickHouse Docs](https://clickhouse.com/docs/integrations/python)
