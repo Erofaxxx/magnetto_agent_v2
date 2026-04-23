@@ -1142,6 +1142,412 @@ async def get_budget(cabinet_name: Optional[str] = None):
         raise HTTPException(status_code=500, detail=f"ClickHouse error: {exc}")
 
 
+# ─── Command Center endpoints ────────────────────────────────────────────────
+# Дневной снапшот по кампаниям/группам/объявлениям из command_center_* витрин.
+# Каждый endpoint читает последний report_date и отдаёт готовый JSON для UI.
+# Формат ответа стабилизирован — совместим с командным центром на фронте.
+
+def _delta_pct(cur: float, prev: float) -> Optional[float]:
+    if not prev:
+        return None
+    return round((cur - prev) / prev * 100, 1)
+
+
+@app.get(
+    "/api/command_center/campaigns",
+    tags=["command_center"],
+    summary="Дневной снапшот кампаний: summary + health_counts + campaigns[]",
+)
+async def get_command_center_campaigns():
+    from config import CLICKHOUSE_DATABASE as CH_DB
+    try:
+        sql = f"""
+            WITH last_d AS (SELECT max(report_date) AS d FROM {CH_DB}.command_center_campaigns)
+            SELECT
+                toString(report_date) AS report_date_str,
+                toInt64(campaign_id)  AS campaign_id,
+                campaign_name, campaign_type, meta_state, status, state,
+                search_strategy, network_strategy, attribution_model,
+                weekly_budget, traffic_mix, semantic_tags,
+                cost_week, revenue_week,
+                impressions_week, clicks_week, leads_week, calls_week, forms_week, orders_week,
+                spam_traffic_week, targeted_calls_week, order_create_started_week, order_created_week,
+                goal_507627231_week, unique_calls_week, quiz_completed_week, phone_clicks_week,
+                cost_prev, revenue_prev,
+                impressions_prev, clicks_prev, leads_prev, calls_prev, forms_prev, orders_prev,
+                spam_traffic_prev, targeted_calls_prev, order_create_started_prev, order_created_prev,
+                goal_507627231_prev, unique_calls_prev, quiz_completed_prev, phone_clicks_prev,
+                roas_week, cpa_week, cpc_week, ctr_week,
+                priority_goal_ids, priority_goal_values,
+                health, health_reason, cabinet_name,
+                arrayMap(x -> toString(x), history_weeks) AS history_weeks,
+                history_cost, history_revenue,
+                history_clicks, history_leads,
+                history_calls, history_forms, history_orders
+            FROM {CH_DB}.command_center_campaigns
+            WHERE report_date = (SELECT d FROM last_d)
+            ORDER BY cost_week DESC, weekly_budget DESC
+        """
+        rows = await asyncio.to_thread(_reports_query_dicts, sql)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"ClickHouse error: {exc}")
+
+    if not rows:
+        return {"report_date": None, "summary": None, "campaigns": [], "health_counts": {"green": 0, "yellow": 0, "red": 0, "pending": 0}}
+
+    report_date = str(rows[0].get("report_date_str") or "")
+    sum_keys = (
+        "cost", "revenue", "impressions", "clicks", "leads", "calls", "forms", "orders",
+        "spam_traffic", "targeted_calls", "order_create_started", "order_created",
+    )
+    totals = {k: {"week": 0.0, "prev": 0.0} for k in sum_keys}
+    campaigns: list[dict] = []
+
+    for r in rows:
+        for k in sum_keys:
+            totals[k]["week"] += _safe_float(r.get(f"{k}_week"))
+            totals[k]["prev"] += _safe_float(r.get(f"{k}_prev"))
+
+        weeks = r.get("history_weeks") or []
+        series = []
+        for i in range(len(weeks)):
+            series.append({
+                "week":    str(weeks[i]),
+                "cost":    _safe_float((r.get("history_cost")    or [0])[i] if i < len(r.get("history_cost")    or []) else 0),
+                "revenue": _safe_float((r.get("history_revenue") or [0])[i] if i < len(r.get("history_revenue") or []) else 0),
+                "clicks":  int(_safe_float((r.get("history_clicks") or [0])[i] if i < len(r.get("history_clicks") or []) else 0)),
+                "leads":   int(_safe_float((r.get("history_leads")  or [0])[i] if i < len(r.get("history_leads")  or []) else 0)),
+                "calls":   int(_safe_float((r.get("history_calls")  or [0])[i] if i < len(r.get("history_calls")  or []) else 0)),
+                "forms":   int(_safe_float((r.get("history_forms")  or [0])[i] if i < len(r.get("history_forms")  or []) else 0)),
+                "orders":  int(_safe_float((r.get("history_orders") or [0])[i] if i < len(r.get("history_orders") or []) else 0)),
+            })
+
+        campaigns.append({
+            "campaign_id":       int(_safe_float(r.get("campaign_id"))),
+            "campaign_name":     str(r.get("campaign_name") or ""),
+            "campaign_type":     str(r.get("campaign_type") or ""),
+            "meta_state":        str(r.get("meta_state") or ""),
+            "status":            str(r.get("status") or ""),
+            "state":             str(r.get("state") or ""),
+            "search_strategy":   str(r.get("search_strategy") or ""),
+            "network_strategy":  str(r.get("network_strategy") or ""),
+            "attribution_model": str(r.get("attribution_model") or ""),
+            "weekly_budget":     _safe_float(r.get("weekly_budget")),
+            "traffic_mix":       str(r.get("traffic_mix") or ""),
+            "semantic_tags":     list(r.get("semantic_tags") or []),
+
+            "cost_week":        _safe_float(r.get("cost_week")),
+            "revenue_week":     _safe_float(r.get("revenue_week")),
+            "impressions_week": int(_safe_float(r.get("impressions_week"))),
+            "clicks_week":      int(_safe_float(r.get("clicks_week"))),
+            "leads_week":       int(_safe_float(r.get("leads_week"))),
+            "calls_week":       int(_safe_float(r.get("calls_week"))),
+            "forms_week":       int(_safe_float(r.get("forms_week"))),
+            "orders_week":      int(_safe_float(r.get("orders_week"))),
+            "spam_traffic_week":         int(_safe_float(r.get("spam_traffic_week"))),
+            "targeted_calls_week":       int(_safe_float(r.get("targeted_calls_week"))),
+            "order_create_started_week": int(_safe_float(r.get("order_create_started_week"))),
+            "order_created_week":        int(_safe_float(r.get("order_created_week"))),
+            "goal_507627231_week":       int(_safe_float(r.get("goal_507627231_week"))),
+            "unique_calls_week":         int(_safe_float(r.get("unique_calls_week"))),
+            "quiz_completed_week":       int(_safe_float(r.get("quiz_completed_week"))),
+            "phone_clicks_week":         int(_safe_float(r.get("phone_clicks_week"))),
+
+            "priority_goal_ids":    [int(_safe_float(x)) for x in (r.get("priority_goal_ids") or [])],
+            "priority_goal_values": [_safe_float(x) for x in (r.get("priority_goal_values") or [])],
+
+            "cost_prev":        _safe_float(r.get("cost_prev")),
+            "revenue_prev":     _safe_float(r.get("revenue_prev")),
+            "impressions_prev": int(_safe_float(r.get("impressions_prev"))),
+            "clicks_prev":      int(_safe_float(r.get("clicks_prev"))),
+            "leads_prev":       int(_safe_float(r.get("leads_prev"))),
+            "calls_prev":       int(_safe_float(r.get("calls_prev"))),
+            "forms_prev":       int(_safe_float(r.get("forms_prev"))),
+            "orders_prev":      int(_safe_float(r.get("orders_prev"))),
+            "spam_traffic_prev":         int(_safe_float(r.get("spam_traffic_prev"))),
+            "targeted_calls_prev":       int(_safe_float(r.get("targeted_calls_prev"))),
+            "order_create_started_prev": int(_safe_float(r.get("order_create_started_prev"))),
+            "order_created_prev":        int(_safe_float(r.get("order_created_prev"))),
+            "goal_507627231_prev":       int(_safe_float(r.get("goal_507627231_prev"))),
+            "unique_calls_prev":         int(_safe_float(r.get("unique_calls_prev"))),
+            "quiz_completed_prev":       int(_safe_float(r.get("quiz_completed_prev"))),
+            "phone_clicks_prev":         int(_safe_float(r.get("phone_clicks_prev"))),
+
+            "roas_week": _safe_float(r.get("roas_week")),
+            "cpa_week":  _safe_float(r.get("cpa_week")),
+            "cpc_week":  _safe_float(r.get("cpc_week")),
+            "ctr_week":  _safe_float(r.get("ctr_week")),
+
+            "health":        str(r.get("health") or ""),
+            "health_reason": str(r.get("health_reason") or ""),
+            "cabinet_name":  str(r.get("cabinet_name") or ""),
+
+            "weekly_series": series,
+        })
+
+    cost_w = totals["cost"]["week"]; cost_p = totals["cost"]["prev"]
+    clicks_w = totals["clicks"]["week"]; clicks_p = totals["clicks"]["prev"]
+    avg_cpc_w = round(cost_w / clicks_w, 2) if clicks_w > 0 else 0.0
+    avg_cpc_p = round(cost_p / clicks_p, 2) if clicks_p > 0 else 0.0
+
+    def _metric(key: str, is_int: bool = False) -> dict:
+        w = totals[key]["week"]; p = totals[key]["prev"]
+        return {
+            "week": int(w) if is_int else round(w, 2),
+            "prev": int(p) if is_int else round(p, 2),
+            "delta_pct": _delta_pct(w, p),
+        }
+
+    summary = {
+        "cost":        _metric("cost"),
+        "revenue":     _metric("revenue"),
+        "avg_cpc":     {"week": avg_cpc_w, "prev": avg_cpc_p, "delta_pct": _delta_pct(avg_cpc_w, avg_cpc_p)},
+        "impressions": _metric("impressions", is_int=True),
+        "clicks":      _metric("clicks", is_int=True),
+        "leads":       _metric("leads", is_int=True),
+        "calls":       _metric("calls", is_int=True),
+        "forms":       _metric("forms", is_int=True),
+        "orders":      _metric("orders", is_int=True),
+        "spam_traffic":         _metric("spam_traffic", is_int=True),
+        "targeted_calls":       _metric("targeted_calls", is_int=True),
+        "order_create_started": _metric("order_create_started", is_int=True),
+        "order_created":        _metric("order_created", is_int=True),
+    }
+
+    health_counts = {"green": 0, "yellow": 0, "red": 0, "pending": 0}
+    for c in campaigns:
+        h = c["health"] or "pending"
+        health_counts[h] = health_counts.get(h, 0) + 1
+
+    return {
+        "report_date": report_date,
+        "summary": summary,
+        "health_counts": health_counts,
+        "campaigns": campaigns,
+    }
+
+
+@app.get(
+    "/api/command_center/adgroups",
+    tags=["command_center"],
+    summary="Группы внутри кампании: totals + health_counts + groups[]",
+)
+async def get_command_center_adgroups(campaign_id: int):
+    if campaign_id <= 0:
+        raise HTTPException(status_code=400, detail="campaign_id обязателен (>0)")
+
+    from config import CLICKHOUSE_DATABASE as CH_DB
+    try:
+        sql = f"""
+            WITH last_d AS (SELECT max(report_date) AS d FROM {CH_DB}.command_center_adgroups)
+            SELECT
+                toString(report_date) AS report_date_str,
+                toInt64(group_id)     AS group_id,
+                group_name,
+                toInt64(campaign_id)  AS campaign_id,
+                campaign_name,
+                status, serving_status, group_type,
+                keyword_count, autotargeting_state, autotargeting_risky,
+                cost_week, revenue_week,
+                impressions_week, clicks_week, leads_week, calls_week, forms_week, orders_week,
+                spam_traffic_week,
+                cost_prev, revenue_prev, clicks_prev, leads_prev, calls_prev, forms_prev,
+                spam_traffic_prev,
+                roas_week, cpa_week, cpc_week, cpc_prev, ctr_week,
+                health, health_reason,
+                arrayMap(x -> toString(x), history_weeks) AS history_weeks,
+                history_cost, history_clicks, history_leads
+            FROM {CH_DB}.command_center_adgroups
+            WHERE report_date = (SELECT d FROM last_d)
+              AND campaign_id = {int(campaign_id)}
+            ORDER BY cost_week DESC
+        """
+        rows = await asyncio.to_thread(_reports_query_dicts, sql)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"ClickHouse error: {exc}")
+
+    report_date = None
+    totals = {k: 0 for k in ("cost_week", "cost_prev", "revenue_week", "clicks_week", "leads_week", "calls_week", "forms_week")}
+    health_counts = {"green": 0, "yellow": 0, "red": 0, "pending": 0}
+    groups: list[dict] = []
+
+    for r in rows:
+        report_date = str(r.get("report_date_str") or "")
+        totals["cost_week"]    += _safe_float(r.get("cost_week"))
+        totals["cost_prev"]    += _safe_float(r.get("cost_prev"))
+        totals["revenue_week"] += _safe_float(r.get("revenue_week"))
+        totals["clicks_week"]  += int(_safe_float(r.get("clicks_week")))
+        totals["leads_week"]   += int(_safe_float(r.get("leads_week")))
+        totals["calls_week"]   += int(_safe_float(r.get("calls_week")))
+        totals["forms_week"]   += int(_safe_float(r.get("forms_week")))
+
+        h = str(r.get("health") or "")
+        health_counts[h] = health_counts.get(h, 0) + 1
+
+        weeks = r.get("history_weeks") or []
+        series = []
+        for i in range(len(weeks)):
+            series.append({
+                "week":   str(weeks[i]),
+                "cost":   _safe_float((r.get("history_cost")   or [0])[i] if i < len(r.get("history_cost")   or []) else 0),
+                "clicks": int(_safe_float((r.get("history_clicks") or [0])[i] if i < len(r.get("history_clicks") or []) else 0)),
+                "leads":  int(_safe_float((r.get("history_leads")  or [0])[i] if i < len(r.get("history_leads")  or []) else 0)),
+            })
+
+        groups.append({
+            "group_id":            int(_safe_float(r.get("group_id"))),
+            "group_name":          str(r.get("group_name") or ""),
+            "campaign_id":         int(_safe_float(r.get("campaign_id"))),
+            "campaign_name":       str(r.get("campaign_name") or ""),
+            "status":              str(r.get("status") or ""),
+            "serving_status":      str(r.get("serving_status") or ""),
+            "group_type":          str(r.get("group_type") or ""),
+            "keyword_count":       int(_safe_float(r.get("keyword_count"))),
+            "autotargeting_state": str(r.get("autotargeting_state") or ""),
+            "autotargeting_risky": int(_safe_float(r.get("autotargeting_risky"))),
+
+            "cost_week":        _safe_float(r.get("cost_week")),
+            "revenue_week":     _safe_float(r.get("revenue_week")),
+            "impressions_week": int(_safe_float(r.get("impressions_week"))),
+            "clicks_week":      int(_safe_float(r.get("clicks_week"))),
+            "leads_week":       int(_safe_float(r.get("leads_week"))),
+            "calls_week":       int(_safe_float(r.get("calls_week"))),
+            "forms_week":       int(_safe_float(r.get("forms_week"))),
+            "orders_week":      int(_safe_float(r.get("orders_week"))),
+            "spam_traffic_week": int(_safe_float(r.get("spam_traffic_week"))),
+
+            "cost_prev":        _safe_float(r.get("cost_prev")),
+            "revenue_prev":     _safe_float(r.get("revenue_prev")),
+            "clicks_prev":      int(_safe_float(r.get("clicks_prev"))),
+            "leads_prev":       int(_safe_float(r.get("leads_prev"))),
+            "calls_prev":       int(_safe_float(r.get("calls_prev"))),
+            "forms_prev":       int(_safe_float(r.get("forms_prev"))),
+            "spam_traffic_prev": int(_safe_float(r.get("spam_traffic_prev"))),
+
+            "roas_week": _safe_float(r.get("roas_week")),
+            "cpa_week":  _safe_float(r.get("cpa_week")),
+            "cpc_week":  _safe_float(r.get("cpc_week")),
+            "cpc_prev":  _safe_float(r.get("cpc_prev")),
+            "ctr_week":  _safe_float(r.get("ctr_week")),
+
+            "health":        h,
+            "health_reason": str(r.get("health_reason") or ""),
+
+            "weekly_series": series,
+        })
+
+    return {
+        "report_date":  report_date,
+        "campaign_id":  int(campaign_id),
+        "totals": {
+            "cost_week":    round(totals["cost_week"], 2),
+            "cost_prev":    round(totals["cost_prev"], 2),
+            "revenue_week": round(totals["revenue_week"], 2),
+            "clicks_week":  totals["clicks_week"],
+            "leads_week":   totals["leads_week"],
+            "calls_week":   totals["calls_week"],
+            "forms_week":   totals["forms_week"],
+        },
+        "health_counts": health_counts,
+        "groups":        groups,
+    }
+
+
+@app.get(
+    "/api/command_center/ads",
+    tags=["command_center"],
+    summary="Объявления внутри группы: health_counts + ads[]",
+)
+async def get_command_center_ads(adgroup_id: int):
+    if adgroup_id <= 0:
+        raise HTTPException(status_code=400, detail="adgroup_id обязателен (>0)")
+
+    from config import CLICKHOUSE_DATABASE as CH_DB
+    try:
+        sql = f"""
+            WITH last_d AS (SELECT max(report_date) AS d FROM {CH_DB}.command_center_ads)
+            SELECT
+                toString(report_date) AS report_date_str,
+                toInt64(ad_id) AS ad_id, toInt64(adgroup_id) AS adgroup_id, toInt64(campaign_id) AS campaign_id,
+                ad_type, ad_subtype, status, state, status_clarification,
+                title, title2, text_body, final_url, has_image,
+                vcard_moderation, ad_image_moderation, sitelinks_moderation,
+                cabinet_name,
+                cost_week, clicks_week, sessions_week, bounces_week, leads_week, spam_traffic_week,
+                cpc_week, bounce_rate_week,
+                cost_prev, clicks_prev, sessions_prev, bounces_prev, leads_prev, spam_traffic_prev,
+                cpc_prev, bounce_rate_prev,
+                health, health_reason
+            FROM {CH_DB}.command_center_ads
+            WHERE report_date = (SELECT d FROM last_d)
+              AND adgroup_id = {int(adgroup_id)}
+            ORDER BY (status = 'REJECTED') DESC, cost_week DESC
+        """
+        rows = await asyncio.to_thread(_reports_query_dicts, sql)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"ClickHouse error: {exc}")
+
+    report_date = None
+    health_counts = {"green": 0, "yellow": 0, "red": 0, "pending": 0}
+    ads: list[dict] = []
+
+    for r in rows:
+        report_date = str(r.get("report_date_str") or "")
+        h = str(r.get("health") or "")
+        health_counts[h] = health_counts.get(h, 0) + 1
+
+        ads.append({
+            "ad_id":                int(_safe_float(r.get("ad_id"))),
+            "adgroup_id":           int(_safe_float(r.get("adgroup_id"))),
+            "campaign_id":          int(_safe_float(r.get("campaign_id"))),
+            "cabinet_name":         str(r.get("cabinet_name") or ""),
+            "ad_type":              str(r.get("ad_type") or ""),
+            "ad_subtype":           str(r.get("ad_subtype") or ""),
+            "status":               str(r.get("status") or ""),
+            "state":                str(r.get("state") or ""),
+            "status_clarification": str(r.get("status_clarification") or ""),
+            "title":                str(r.get("title") or ""),
+            "title2":               str(r.get("title2") or ""),
+            "text_body":            str(r.get("text_body") or ""),
+            "final_url":            str(r.get("final_url") or ""),
+            "has_image":            int(_safe_float(r.get("has_image"))),
+            "vcard_moderation":     str(r.get("vcard_moderation") or ""),
+            "ad_image_moderation":  str(r.get("ad_image_moderation") or ""),
+            "sitelinks_moderation": str(r.get("sitelinks_moderation") or ""),
+            "cost_week":         _safe_float(r.get("cost_week")),
+            "clicks_week":       int(_safe_float(r.get("clicks_week"))),
+            "sessions_week":     int(_safe_float(r.get("sessions_week"))),
+            "bounces_week":      int(_safe_float(r.get("bounces_week"))),
+            "leads_week":        int(_safe_float(r.get("leads_week"))),
+            "spam_traffic_week": int(_safe_float(r.get("spam_traffic_week"))),
+            "cpc_week":          _safe_float(r.get("cpc_week")),
+            "bounce_rate_week":  _safe_float(r.get("bounce_rate_week")),
+            "cost_prev":         _safe_float(r.get("cost_prev")),
+            "clicks_prev":       int(_safe_float(r.get("clicks_prev"))),
+            "sessions_prev":     int(_safe_float(r.get("sessions_prev"))),
+            "bounces_prev":      int(_safe_float(r.get("bounces_prev"))),
+            "leads_prev":        int(_safe_float(r.get("leads_prev"))),
+            "spam_traffic_prev": int(_safe_float(r.get("spam_traffic_prev"))),
+            "cpc_prev":          _safe_float(r.get("cpc_prev")),
+            "bounce_rate_prev":  _safe_float(r.get("bounce_rate_prev")),
+            "health":        h,
+            "health_reason": str(r.get("health_reason") or ""),
+        })
+
+    return {
+        "report_date":   report_date,
+        "adgroup_id":    int(adgroup_id),
+        "health_counts": health_counts,
+        "ads":           ads,
+    }
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run("api_server:app", host=HOST, port=PORT, log_level="info")
