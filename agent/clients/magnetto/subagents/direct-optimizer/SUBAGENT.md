@@ -8,7 +8,9 @@ description: |
   SEARCH vs РСЯ, is_chronic, zone_status, минус-слова, автотаргетинг, модерация креативов.
   НЕ используй для: вопросов по трафику/UTM без cost (тогда generalist + dm_traffic_performance),
   client-level анализа (profile, journey, conversion_paths — тогда generalist),
-  скоринга клиентов (scoring-intelligence).
+  скоринга клиентов (scoring-intelligence),
+  состояния дашборда командного центра / health кампаний / week vs prev / drill campaign→adgroup→ad
+  по snapshot-витринам — это command-center.
 model: anthropic/claude-sonnet-4.6
 schema_tables:
   - bad_keywords
