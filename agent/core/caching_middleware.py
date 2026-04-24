@@ -43,6 +43,7 @@ ToolMessage, пишет только последний tool_result. Без эт
 """
 from __future__ import annotations
 
+import os
 from copy import copy
 from typing import Any
 
@@ -52,6 +53,82 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 
 # Anthropic hard limit — не более 4 cache_control маркеров в одном запросе.
 _MAX_BREAKPOINTS = 4
+
+# Логировать usage cache statistics в stdout (→ journalctl -u analytics-agent)
+# Включено по умолчанию, отключить: CACHE_LOG=0
+_CACHE_LOG = os.environ.get("CACHE_LOG", "1") != "0"
+
+
+def _extract_cache_stats(response) -> dict:
+    """
+    Try both canonical Anthropic/LangChain locations for cache usage:
+      - response.usage_metadata.input_token_details.{cache_read, cache_creation}
+      - response.response_metadata.token_usage.prompt_tokens_details.{cached_tokens, cache_write_tokens}
+    Return a normalized dict or {} if nothing found.
+    """
+    out = {}
+    um = getattr(response, "usage_metadata", None) or {}
+    if isinstance(um, dict):
+        itd = um.get("input_token_details") or {}
+        out["in"] = um.get("input_tokens")
+        out["out"] = um.get("output_tokens")
+        if itd.get("cache_read") is not None:
+            out["read"] = itd.get("cache_read")
+        if itd.get("cache_creation") is not None:
+            out["write"] = itd.get("cache_creation")
+    rm = getattr(response, "response_metadata", None) or {}
+    if isinstance(rm, dict):
+        tu = rm.get("token_usage") or {}
+        ptd = tu.get("prompt_tokens_details") or {}
+        if "read" not in out and ptd.get("cached_tokens") is not None:
+            out["read"] = ptd.get("cached_tokens")
+        if "write" not in out and ptd.get("cache_write_tokens") is not None:
+            out["write"] = ptd.get("cache_write_tokens")
+        if "in" not in out and tu.get("prompt_tokens") is not None:
+            out["in"] = tu.get("prompt_tokens")
+        if "out" not in out and tu.get("completion_tokens") is not None:
+            out["out"] = tu.get("completion_tokens")
+    return out
+
+
+def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
+    if not _CACHE_LOG:
+        return
+    stats = _extract_cache_stats(response)
+    if not stats:
+        return
+    # Count tool/human messages for context
+    n_tools = sum(1 for m in request.messages if isinstance(m, ToolMessage))
+    n_humans = sum(1 for m in request.messages if isinstance(m, HumanMessage))
+    in_tok = stats.get("in", "?")
+    out_tok = stats.get("out", "?")
+    read = stats.get("read", 0) or 0
+    write = stats.get("write", 0) or 0
+    uncached = (in_tok - read - write) if isinstance(in_tok, int) else "?"
+    print(
+        f"[cache {agent_name}] tools={n_tools} humans={n_humans} | "
+        f"in={in_tok} read={read} write={write} uncached={uncached} | out={out_tok}",
+        flush=True,
+    )
+
+
+def _agent_name_from_request(request: ModelRequest) -> str:
+    """
+    Best-effort label: main / subagent / generalist. В ModelRequest прямого
+    имени нет, используем косвенные признаки — есть ли в request.tools
+    вызов 'task' (только у main).
+    """
+    try:
+        tool_names = {getattr(t, "name", "") for t in (request.tools or [])}
+        if "task" in tool_names:
+            return "main"
+        if "delegate_to_generalist" in tool_names:
+            return "main"
+        if "sample_table" in tool_names:
+            return "sub"
+        return "agent"
+    except Exception:
+        return "agent"
 
 
 def _is_anthropic(model: Any) -> bool:
@@ -185,10 +262,16 @@ class CachingMiddleware(AgentMiddleware):
         if not _is_anthropic(request.model):
             return handler(request)
         _apply_breakpoints(request)
-        return handler(request)
+        agent = _agent_name_from_request(request)
+        response = handler(request)
+        _log_cache(agent, request, response)
+        return response
 
     async def awrap_model_call(self, request: ModelRequest, handler):
         if not _is_anthropic(request.model):
             return await handler(request)
         _apply_breakpoints(request)
-        return await handler(request)
+        agent = _agent_name_from_request(request)
+        response = await handler(request)
+        _log_cache(agent, request, response)
+        return response
