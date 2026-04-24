@@ -1,42 +1,23 @@
 """
-CachingMiddleware — ставит `cache_control: ephemeral` на стабильные блоки
-system prompt и messages, чтобы Anthropic prompt caching работал на полную
-глубину tool-chain'а.
+CachingMiddleware — логирует Anthropic prompt-cache usage stats.
 
-Anthropic разрешает **до 4 cache_control маркеров в одном запросе**.
-Используем все 4, чтобы получить rolling incremental cache внутри turn'а:
+После перехода на OpenRouter automatic caching (top-level `cache_control`
+в `ChatOpenAI(extra_body=...)`, см. agent_factory._build_model) ручная
+расстановка cache_control маркеров на блоки сообщений больше не нужна:
+Anthropic сам двигает breakpoint в конец истории на каждом запросе и
+кэширует префикс инкрементально. TTL 5 минут (default).
 
-  1. System prompt (последний блок). Самая стабильная часть — AGENTS.md +
-     data_map.md + skills index + SUBAGENT.md body + schema_section + блок
-     «Сегодня + НДС». Меняется только в полночь (новая дата), всё остальное
-     время byte-stable → кэш живёт.
+Этот middleware остаётся как pure logger:
+  - извлекает usage_metadata из ответа модели
+  - печатает [cache <agent>] tools=N humans=M | in=X read=Y write=Z uncached=W
+  - различает main / sub / generalist по составу tools
+  - вывод идёт в stdout → journalctl -u analytics-agent
 
-  2. Последний HumanMessage. Граница «история до текущего turn». В пределах
-     одного turn'а не сдвигается.
-
-  3. Предпоследний ToolMessage (если есть). Ключевая точка для rolling
-     window: на шаге N+1 он уже был «последним ToolMessage» на шаге N,
-     Anthropic записал кэш до этой позиции на шаге N, и на шаге N+1
-     Anthropic находит hit до этой позиции через prefix match.
-
-  4. Последний ToolMessage. Новый «конец известного мира» — кэш пишется
-     только на дельту между (3) и (4) — это обычно один свежий tool_result.
-
-Итог: каждый следующий model_call читает из кэша всё до предпоследнего
-ToolMessage, пишет только последний tool_result. Без этой схемы (до фикса)
-на каждом шаге переписывался ВЕСЬ накопленный tool-chain, потому что
-маркер был только на самом свежем tool_result, а Anthropic проверяет hits
-только на позициях текущих маркеров.
-
-Правила:
-  - Работает только если модель — Anthropic (детектится по имени).
-  - Для не-Anthropic (DeepSeek, OpenAI) не делает ничего.
-  - Не модифицирует сам текст, только оборачивает content в блочный формат
-    с cache_control (метаданные, не участвуют в хэше кэш-ключа).
+Disable via env: CACHE_LOG=0.
 
 Использование:
   create_deep_agent(
-      model=...,
+      model=...,                 # ChatOpenAI с extra_body.cache_control
       middleware=[CachingMiddleware()],
       ...
   )
@@ -44,15 +25,11 @@ ToolMessage, пишет только последний tool_result. Без эт
 from __future__ import annotations
 
 import os
-from copy import copy
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-
-# Anthropic hard limit — не более 4 cache_control маркеров в одном запросе.
-_MAX_BREAKPOINTS = 4
 
 # Логировать usage cache statistics в stdout (→ journalctl -u analytics-agent)
 # Включено по умолчанию, отключить: CACHE_LOG=0
@@ -62,8 +39,8 @@ _CACHE_LOG = os.environ.get("CACHE_LOG", "1") != "0"
 def _unwrap_ai_message(response):
     """
     LangChain middleware wrap_model_call sees response as ModelResponse
-    (dataclass with .result: list[BaseMessage]) or ExtendedModelResponse
-    (wraps ModelResponse). usage lives on the last AIMessage inside .result.
+    (dataclass с .result: list[BaseMessage]) или ExtendedModelResponse
+    (wraps ModelResponse). usage живёт на последнем AIMessage внутри .result.
     Unwrap iteratively.
     """
     from langchain_core.messages import AIMessage as _AIMessage
@@ -79,15 +56,12 @@ def _unwrap_ai_message(response):
         # ModelResponse.result → list[BaseMessage]
         if hasattr(node, "result"):
             result = getattr(node, "result") or []
-            # последний AIMessage в result — тот, где usage
             for m in reversed(result):
                 if isinstance(m, _AIMessage):
                     return m
             return None
-        # already an AIMessage
         if isinstance(node, _AIMessage):
             return node
-        # dict-shaped
         if isinstance(node, dict):
             res = node.get("result")
             if isinstance(res, list):
@@ -145,7 +119,6 @@ def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
     if not stats:
         # Тихо: если usage недоступен — просто ничего не пишем
         return
-    # Count tool/human messages for context
     n_tools = sum(1 for m in request.messages if isinstance(m, ToolMessage))
     n_humans = sum(1 for m in request.messages if isinstance(m, HumanMessage))
     in_tok = stats.get("in")
@@ -167,9 +140,9 @@ def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
 
 def _agent_name_from_request(request: ModelRequest) -> str:
     """
-    Best-effort label: main / subagent / generalist. В ModelRequest прямого
-    имени нет, используем косвенные признаки — есть ли в request.tools
-    вызов 'task' (только у main).
+    Best-effort label: main / sub / agent. В ModelRequest прямого имени нет,
+    используем косвенные признаки — есть ли в request.tools 'task' или
+    'delegate_to_generalist' (только у main), 'sample_table' (subagent).
     """
     try:
         tool_names = {getattr(t, "name", "") for t in (request.tools or [])}
@@ -184,147 +157,22 @@ def _agent_name_from_request(request: ModelRequest) -> str:
         return "agent"
 
 
-def _is_anthropic(model: Any) -> bool:
-    """Detect Anthropic-backed model (direct ChatAnthropic or OpenRouter wrapper)."""
-    # Direct Anthropic wrapper
-    cls = type(model).__name__
-    if "Anthropic" in cls:
-        return True
-    # OpenRouter / OpenAI-compatible wrappers — inspect model name
-    for attr in ("model_name", "model", "model_id"):
-        val = getattr(model, attr, None)
-        if isinstance(val, str) and "claude" in val.lower():
-            return True
-    # extra_body pinning check
-    extra = getattr(model, "extra_body", None) or {}
-    if isinstance(extra, dict):
-        provider = extra.get("provider", {})
-        if isinstance(provider, dict):
-            order = provider.get("order") or []
-            if any("anthropic" in str(p).lower() for p in order):
-                return True
-    return False
-
-
-def _attach_cache_control(content: Any) -> list[dict]:
-    """
-    Normalize `content` to list-of-blocks and attach cache_control ephemeral
-    to the last block.  Returns a fresh list (does not mutate input).
-    """
-    if isinstance(content, str):
-        if not content:
-            return content  # type: ignore[return-value]
-        return [{
-            "type": "text",
-            "text": content,
-            "cache_control": {"type": "ephemeral"},
-        }]
-    if isinstance(content, list):
-        if not content:
-            return content
-        new = [dict(b) if isinstance(b, dict) else b for b in content]
-        last = new[-1]
-        if isinstance(last, dict):
-            last = dict(last)
-            last["cache_control"] = {"type": "ephemeral"}
-            new[-1] = last
-        return new
-    return content
-
-
-def _clone_message_with_content(msg, new_content):
-    """Create a copy of msg with replaced content (pydantic-safe)."""
-    try:
-        return msg.model_copy(update={"content": new_content})
-    except Exception:
-        out = copy(msg)
-        out.content = new_content
-        return out
-
-
-def _apply_breakpoints(request: ModelRequest) -> None:
-    """
-    Shared logic for sync/async wrap_model_call. Mutates `request` in-place:
-      - attaches cache_control to the last block of system_message (breakpoint #1)
-      - attaches cache_control to up to TWO last ToolMessage positions
-        (breakpoints #2 and #3 — rolling window for tool-chain)
-      - attaches cache_control to the last HumanMessage (breakpoint #4)
-
-    Total ≤ 4, within Anthropic's hard limit.
-    """
-    # ── 1. System prompt breakpoint ───────────────────────────────────────
-    if request.system_message is not None:
-        content = request.system_message.content
-        new_content = _attach_cache_control(content)
-        if new_content is not content:
-            request.system_message = _clone_message_with_content(
-                request.system_message, new_content
-            )
-
-    # ── 2-4. Messages: last HumanMessage + last TWO ToolMessage'ей ────────
-    msgs = list(request.messages)
-
-    # Все индексы ToolMessage в порядке появления
-    tool_indices = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
-
-    # Последний HumanMessage
-    last_human_idx = next(
-        (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], HumanMessage)),
-        None,
-    )
-
-    # Соберём позиции для маркеров (ставим на 2 последних ToolMessage +
-    # последний HumanMessage). Это максимум 3 маркера в messages + 1 system
-    # = 4, укладываемся в Anthropic лимит.
-    positions_to_mark: list[int] = []
-    positions_to_mark.extend(tool_indices[-2:])           # последние 2 ToolMessage
-    if last_human_idx is not None:
-        positions_to_mark.append(last_human_idx)
-
-    # Дедуплицируем (на всякий — теоретически последний human не может быть
-    # tool, но защищаемся) и применяем маркеры.
-    marked: set[int] = set()
-    for idx in positions_to_mark:
-        if idx in marked:
-            continue
-        msg = msgs[idx]
-        new_c = _attach_cache_control(msg.content)
-        if new_c is not msg.content:
-            msgs[idx] = _clone_message_with_content(msg, new_c)
-            marked.add(idx)
-
-    request.messages = msgs
-
-
 class CachingMiddleware(AgentMiddleware):
     """
-    Attach `cache_control: ephemeral` strategically on up to 4 positions:
-      1. System prompt (last block)
-      2. Previous-to-last ToolMessage  (rolling-window anchor)
-      3. Last ToolMessage              (current tool-chain tip)
-      4. Last HumanMessage             (turn boundary)
+    Pure-logging middleware: печатает usage stats после каждого model call.
 
-    With (2) in place, each successive model_call in a tool-chain reads from
-    cache up to the previous ToolMessage and writes only the delta (one new
-    tool_result). Before this change only (3) was marked, so Anthropic could
-    only find cache-hit up to HumanMessage — causing the whole accumulated
-    tool-chain to be re-written on every step.
+    Кэшированием управляет OpenRouter automatic caching, настроенный через
+    `ChatOpenAI(extra_body={"cache_control": {"type": "ephemeral"}})` в
+    `agent_factory._build_model`. Anthropic auto-advances cache breakpoint
+    в конец сообщений на каждом запросе.
     """
 
     def wrap_model_call(self, request: ModelRequest, handler):
-        if not _is_anthropic(request.model):
-            return handler(request)
-        _apply_breakpoints(request)
-        agent = _agent_name_from_request(request)
         response = handler(request)
-        _log_cache(agent, request, response)
+        _log_cache(_agent_name_from_request(request), request, response)
         return response
 
     async def awrap_model_call(self, request: ModelRequest, handler):
-        if not _is_anthropic(request.model):
-            return await handler(request)
-        _apply_breakpoints(request)
-        agent = _agent_name_from_request(request)
         response = await handler(request)
-        _log_cache(agent, request, response)
+        _log_cache(_agent_name_from_request(request), request, response)
         return response
