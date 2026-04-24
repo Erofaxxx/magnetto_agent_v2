@@ -1,9 +1,13 @@
 """
-DynamicContextMiddleware — дописывает в конец system-prompt две строки:
-сегодняшнюю дату (Europe/Moscow) и ставку НДС. Блок идёт БЕЗ cache_control,
-поэтому живёт только текущий запрос и не ломает Anthropic prompt caching.
+DynamicContextMiddleware — дописывает в system-prompt блок «Сегодня + НДС»
+(Europe/Moscow). Блок кладётся ПЕРЕД тем, как CachingMiddleware расставит
+cache_control, поэтому он попадает ВНУТРЬ кэша.
 
-Ставить в middleware-списке ПОСЛЕ CachingMiddleware (innermost).
+Стоимость: один cache miss в сутки (при смене даты), дальше cache read.
+Плюс: блок становится жёсткой частью system prompt — модель обязана его
+учитывать, а не использовать training-data дату.
+
+Ставить в middleware-списке ДО CachingMiddleware (outermost / первым).
 """
 from __future__ import annotations
 
@@ -24,9 +28,18 @@ def _dynamic_block() -> str:
     today = now.date().isoformat()
     year = now.year
     return (
-        f"\nСегодня: {today}. Любой относительный период без года "
-        f"(«за март», «в этом месяце», «на прошлой неделе») — это {year} год.\n"
-        f"НДС в РФ: 22% (cost в витринах Директа хранится БЕЗ НДС; с НДС = cost × 1.22).\n"
+        "\n\n---\n"
+        "## Актуальный контекст даты и налога (жёсткая инструкция)\n\n"
+        f"- **Сегодня: {today}** (Europe/Moscow).\n"
+        f"- Любой относительный период без явного года («за март», «в этом месяце», "
+        f"«на прошлой неделе», «вчера», «за квартал») — это **{year} год**. "
+        "НЕ используй даты из training-data, используй ТОЛЬКО дату выше как единственный "
+        "источник истины о «сейчас».\n"
+        "- **НДС в РФ: 22%** (действует с 1 января 2026).\n"
+        "    - `cost` в витринах Яндекс.Директа хранится **БЕЗ НДС**.\n"
+        "    - «расход с НДС» = `cost × 1.22`; «расход без НДС» = `cost` как есть.\n"
+        "    - Если в вопросе НДС не упомянут — отдавай как `cost` (без НДС), но одной "
+        "строкой упомяни что это без НДС.\n"
     )
 
 
@@ -40,6 +53,13 @@ def _clone(msg, new_content):
 
 
 class DynamicContextMiddleware(AgentMiddleware):
+    """
+    Append today+VAT block to the END of system prompt content.
+
+    Place FIRST in the middleware list so CachingMiddleware (second) sees
+    the modified content and includes the block under cache_control.
+    """
+
     def wrap_model_call(self, request: ModelRequest, handler):
         sm = request.system_message
         if sm is not None:

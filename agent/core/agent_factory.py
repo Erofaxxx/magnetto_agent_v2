@@ -126,7 +126,10 @@ def build_agent(
         client_dir=client_dir,
         default_model=llm,
         tools_fn=lambda: tool_list_subagent,
-        middleware=[CachingMiddleware(), DynamicContextMiddleware()],
+        # ORDER: DynamicContext first (outermost) → today+VAT запечатаны В system
+        # prompt ДО cache_control, поэтому сидят внутри кэша. Один cache-miss
+        # в сутки в полночь МСК, дальше cache read.
+        middleware=[DynamicContextMiddleware(), CachingMiddleware()],
     )
     main_tools = [
         think_tool,
@@ -143,20 +146,24 @@ def build_agent(
         default_model=llm,
         tools=tool_list_subagent,
     )
-    # Replace model strings with model instances (pin Anthropic provider)
-    # + attach CachingMiddleware so Anthropic prompt caching hits for subagent
-    # system prompts (schema + skills) and tool-message breakpoints. Without it
-    # every subagent call is a cache miss and burns 8–15K input tokens each time.
+    # Replace model strings with model instances (pin Anthropic provider).
+    #
+    # Middleware order (outermost → innermost): DynamicContext + Caching.
+    # DynamicContext FIRST так, чтобы today+VAT упаковались В system prompt
+    # ДО того, как CachingMiddleware поставит cache_control. Подагент видит
+    # actual дату как часть своего system prompt, и этот блок кэшируется
+    # вместе с остальной стабильной частью (schema + skills).
     for spec in subagent_specs:
         mdl = spec.get("model")
         if isinstance(mdl, str):
             spec["model"] = _build_model(mdl)
         existing_mw = list(spec.get("middleware") or [])
-        if not any(isinstance(m, CachingMiddleware) for m in existing_mw):
-            existing_mw.append(CachingMiddleware())
-        if not any(isinstance(m, DynamicContextMiddleware) for m in existing_mw):
-            existing_mw.append(DynamicContextMiddleware())
-        spec["middleware"] = existing_mw
+        # Strip any pre-existing copies to enforce correct order
+        existing_mw = [
+            m for m in existing_mw
+            if not isinstance(m, (DynamicContextMiddleware, CachingMiddleware))
+        ]
+        spec["middleware"] = [DynamicContextMiddleware(), CachingMiddleware()] + existing_mw
 
     # ── Checkpointer (per-process single conn) ──────────────────────────
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
@@ -178,14 +185,22 @@ def build_agent(
         subagents=subagent_specs,
         backend=backend_factory,
         middleware=[
-            # ORDER matters: Caching outermost (wraps model calls),
-            # DynamicContext innermost → today+VAT appended AFTER cache_control,
-            # so it stays out of cache and updates every call.
+            # ORDER (outermost → innermost):
+            # 1) DynamicContext FIRST — добавляет today+VAT в system prompt,
+            #    ДО того как Caching поставит cache_control. Блок становится
+            #    жёсткой частью системной инструкции и лежит ВНУТРИ кэша.
+            #    Cache miss 1 раз в сутки при смене даты — терпимо.
+            # 2) Caching — ставит cache_control на: последний блок system
+            #    (включая today+VAT), последний ToolMessage (граница истории),
+            #    последний HumanMessage (свежий пользовательский ввод).
+            #    Всё это кэшируется на 5 мин Anthropic ephemeral TTL.
+            # 3-4) Enforcement — перехватывают сложные clickhouse_query/hardcode
+            #    на wrap_tool_call, к model_call не относятся.
+            DynamicContextMiddleware(),
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_ITERATIONS),
             RoutingEnforcer(),       # blocks complex clickhouse_query without delegation
             HardcodeDetector(),      # blocks pd.DataFrame({...: [lits]}) patterns
-            DynamicContextMiddleware(),
         ],
         checkpointer=checkpointer,
     )

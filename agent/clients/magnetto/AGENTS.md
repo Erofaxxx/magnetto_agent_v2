@@ -25,6 +25,7 @@ Goal_id ↔ goal_name — в `/skills/goals-reference/SKILL.md`. Читай ег
 
 ## Доступные домен-субагенты
 
+- **`command-center`** — командный центр портфеля (дашборд /budget): health-зоны кампаний/групп/объявлений, сравнение week vs prev, drill campaign → adgroup → ad, бюджет vs факт, интерпретация брифинга от «выделения области». Использует: command_center_campaigns, command_center_adgroups, command_center_ads, budget_reallocation.
 - **`direct-optimizer`** — оптимизация Яндекс Директа: плохие ключи / площадки РСЯ / поисковые запросы / настройки кампаний / креативы. Использует: bad_keywords, bad_placements, bad_queries, campaigns_settings, adgroups_settings, ads_settings, dm_direct_performance.
 - **`scoring-intelligence`** — скоринг клиентов / lift целей / скорость воронки / паттерны каналов / ежедневный брифинг. Использует: dm_active_clients_scoring, dm_step_goal_impact, dm_funnel_velocity, dm_path_templates, report_daily_briefing.
 
@@ -53,10 +54,33 @@ Goal_id ↔ goal_name — в `/skills/goals-reference/SKILL.md`. Читай ег
    - какие skills из списка в твоём system prompt подходят (матчи description)
    - какой subagent взять: специализированный или generalist
 
-4. **Выбор маршрута (один из трёх):**
+4. **Выбор маршрута (один из четырёх):**
+   - **Командный центр / health / дашборд /budget** (command_center_campaigns / _adgroups / _ads / budget_reallocation, health='red/yellow', weekly_budget vs cost, drill campaign → adgroup → ad, брифинг от «выделения области») → `task(name="command-center", ...)`.
    - **Директ-оптимизация** (bad_keywords / bad_placements / bad_queries / настройки / dm_direct_performance) → `task(name="direct-optimizer", ...)`. НЕ передавай skills/tables — они у него вшиты.
    - **Скоринг / воронка / брифинг** (dm_active_clients_scoring / dm_step_goal_impact / dm_funnel_velocity / dm_path_templates / report_daily_briefing) → `task(name="scoring-intelligence", ...)`.
    - **Всё остальное** (трафик, клиенты, каналы, атрибуция, когорты, сегменты, UTM, aggregates по dm_traffic_performance / dm_client_profile / dm_client_journey / dm_conversion_paths / visits_all_fields) → `delegate_to_generalist(task=..., tables=[...], skills=[...])`.
+
+### Протокол `task(description=...)` — как писать задачу подагенту
+
+Подагент стартует с **чистой истории**, он НЕ видит твою предыдущую переписку и уже выполненные тобой SQL/think_tool. Всё что ему нужно знать — клади в `description`. Это самый дешёвый способ сэкономить: хорошо сформулированная задача = 1 SQL у подагента вместо 3-4.
+
+Минимум в description (по порядку):
+
+1. **Конкретный вопрос в одной фразе** — что пользователь спросил, своими словами.
+2. **Контекст из диалога**, если есть: «ранее в сессии мы уже выгрузили топ-10 кампаний в `/parquet/abc.parquet`», «сравни с тем что было на прошлой неделе», «смотри только кабинет tab2 (Нити)».
+3. **Явные фильтры / ID / даты** — если в вопросе пользователя есть число/id/период, продублируй их явно. Подагент не должен их вычленять из прозы.
+4. **Ожидаемый формат ответа** — «короткая таблица campaign_name / cost_week / health», «одна цифра», «markdown со ссылкой на parquet».
+5. **Что НЕ делать**, если это спасёт от блуждания — «не лезь в сырой `dm_direct_performance`, используй command_center_*», «не драйви в историю глубже 12 недель», «ROAS не считай — `purchase_revenue` пуст с 2025-11-17».
+
+Примеры плохого и хорошего `description`:
+
+- ❌ `"Что там у нас с кампаниями"` — подагент будет гадать про период, метрики, кабинет.
+- ✅ `"Сколько кампаний в красной зоне сейчас (report_date = max) и какие три главные причины по health_reason. Формат: число + таблица с 3 кластерами причин + счётчик кампаний в каждом. Кабинет не фильтруй, по всему портфелю."`
+
+- ❌ `"Разберись с бюджетом"` — какая кампания, за какой период, что считаем.
+- ✅ `"У кампании id 702740178 (Оригана / Конкуренты Поиск) cost_week выше weekly_budget на 40%. Проверь её adgroups (command_center_adgroups WHERE campaign_id=702740178): какая группа ест больше всех и почему (health_reason). Верни таблицу group_name / cost_week / health / health_reason."`
+
+Если пользователь обвёл что-то на дашборде (`"Контекст выделения на дашборде:"` в его сообщении) — **передай блок выделения в description ЦЕЛИКОМ**, не пересказывай. Подагент `command-center` умеет его парсить, см. его скилл `command-center-selection`.
 
 5. **Drilldown-правило (автоматическое):** если группировка даёт ОДНО значение с долей >60% от суммы (например, `traffic_source='ad'` = 95%) — сразу после первого шага сделай второй с более детальной разбивкой (по `utm_source`, `utm_campaign`, `ad_network_type`, `search_engine`, `device_category`). Одноуровневая агрегация с доминирующей долей — малоинформативна, маркетологу нужна детализация.
 
