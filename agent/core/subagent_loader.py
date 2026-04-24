@@ -31,7 +31,7 @@ Subagent YAML/Markdown loader — парсит `SUBAGENT.md` с frontmatter и
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Union
 
 import yaml
 
@@ -54,7 +54,7 @@ def load_subagents(
     client_dir: Path,
     *,
     default_model,
-    tools: list,
+    tools: Union[list, Callable[[list[str]], list]],
 ) -> list[dict]:
     """
     Build a list of SubAgent dicts for create_deep_agent.
@@ -62,7 +62,10 @@ def load_subagents(
     Args:
         client_dir: e.g. /path/to/clients/magnetto
         default_model: LangChain model instance (used if SUBAGENT.md has no model)
-        tools: default tool list for all subagents
+        tools: либо общий список tools (legacy), либо фабрика
+               `tools(schema_tables: list[str]) -> list[tool]`, которая строит
+               персональный набор tools для каждого subagent'а (нужно для
+               per-subagent scope, например sample_table со своими allowed_tables).
 
     Returns:
         List of dicts matching deepagents.SubAgent TypedDict.
@@ -120,11 +123,14 @@ def load_subagents(
         if shared_skills_dir.exists():
             skills_paths.append(str(shared_skills_dir))
 
+        # Персонализируем tool-список если передана фабрика
+        sub_tools = tools(schema_tables) if callable(tools) else tools
+
         entry: dict[str, Any] = {
             "name": name,
             "description": description,
             "system_prompt": rendered_prompt,
-            "tools": tools,
+            "tools": sub_tools,
         }
         if meta.get("model"):
             # Caller decides whether to instantiate model or pass as string — we pass through

@@ -26,7 +26,8 @@ from .caching_middleware import CachingMiddleware
 from .budget_middleware import BudgetMiddleware
 from .delegate_to_generalist import make_delegate_to_generalist_tool
 from .dynamic_context_middleware import DynamicContextMiddleware
-from .enforcement_middleware import HardcodeDetector, RoutingEnforcer
+from .enforcement_middleware import HardcodeDetector
+from .exploration_tools import make_sample_table_tool
 from .schema_cache import get_schema_cache
 from .session_backend import make_backend_factory
 from .subagent_loader import load_subagents
@@ -120,31 +121,48 @@ def build_agent(
     # ── Session-scoped backend factory ───────────────────────────────────
     backend_factory = make_backend_factory(client_id=client_id)
 
-    # ── Tools for main agent (plus delegate_to_generalist closure) ──────
-    tool_list_subagent = [clickhouse_query, python_analysis, think_tool]
+    # ── Tools for subagents & generalist (per-subagent scope) ───────────
+    # Фабрика: для каждого subagent / generalist собираем список tools
+    # с персональным sample_table, scoped на его schema_tables.
+    # Это не даёт подагенту заглядывать в таблицы чужой доменной зоны.
+    def _make_subagent_tools(schema_tables: list[str]) -> list:
+        return [
+            clickhouse_query,
+            python_analysis,
+            think_tool,
+            make_sample_table_tool(allowed_tables=schema_tables or []),
+        ]
+
+    # delegate_to_generalist: tables передаются тем же путём — generalist
+    # получает sample_table только по тем таблицам, что главный агент
+    # явно указал в tables=[...].
     delegate_tool = make_delegate_to_generalist_tool(
         client_dir=client_dir,
         default_model=llm,
-        tools_fn=lambda: tool_list_subagent,
+        tools_fn=_make_subagent_tools,
         # ORDER: DynamicContext first (outermost) → today+VAT запечатаны В system
         # prompt ДО cache_control, поэтому сидят внутри кэша. Один cache-miss
         # в сутки в полночь МСК, дальше cache read.
         middleware=[DynamicContextMiddleware(), CachingMiddleware()],
     )
+
+    # Main agent: НЕ держит clickhouse_query. Архитектурное разделение —
+    # main только роутит и пост-обрабатывает parquet через python_analysis.
+    # Все SQL идут через task(...) / delegate_to_generalist(...).
     main_tools = [
         think_tool,
-        clickhouse_query,        # rare: COUNT / single-fact / post-processing support
         python_analysis,         # post-processing of parquet returned by subagents
-        list_tables,             # fallback only
+        list_tables,             # резерв для роутинга «а есть ли такая витрина»
         delegate_tool,
     ]
 
     # ── Subagents (specialized) ─────────────────────────────────────────
-    # subagent_loader returns dicts with model strings; convert to ChatOpenAI
+    # subagent_loader returns dicts with model strings; convert to ChatOpenAI.
+    # tools — callable, loader вызовет её с schema_tables каждого subagent'а.
     subagent_specs = load_subagents(
         client_dir=client_dir,
         default_model=llm,
-        tools=tool_list_subagent,
+        tools=_make_subagent_tools,
     )
     # Replace model strings with model instances (pin Anthropic provider).
     #
@@ -194,12 +212,13 @@ def build_agent(
             #    (включая today+VAT), последний ToolMessage (граница истории),
             #    последний HumanMessage (свежий пользовательский ввод).
             #    Всё это кэшируется на 5 мин Anthropic ephemeral TTL.
-            # 3-4) Enforcement — перехватывают сложные clickhouse_query/hardcode
-            #    на wrap_tool_call, к model_call не относятся.
+            # 3) HardcodeDetector — ловит pd.DataFrame({...: [литералы]}) в
+            #    python_analysis, на wrap_tool_call.
+            # RoutingEnforcer убран: main физически не имеет clickhouse_query,
+            # больше нечего блокировать.
             DynamicContextMiddleware(),
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_ITERATIONS),
-            RoutingEnforcer(),       # blocks complex clickhouse_query without delegation
             HardcodeDetector(),      # blocks pd.DataFrame({...: [lits]}) patterns
         ],
         checkpointer=checkpointer,
