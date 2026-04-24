@@ -75,29 +75,53 @@ def make_sample_table_tool(allowed_tables: Iterable[str]):
     @tool
     def sample_table(table_name: str, n: int = 5) -> str:
         """
-        Получить первые N строк из таблицы ClickHouse, чтобы увидеть реальные данные.
+        Discovery-tool: получить N строк из таблицы ClickHouse, чтобы УВИДЕТЬ
+        реальные данные перед тем как принимать решения.
 
-        Когда использовать:
-        - Узнать какие значения бывают в enum/LowCardinality колонках
-          (cabinet_name, traffic_source, status, zone_status, …).
-        - Проверить формат Array-поля (goalsID, channels_path, semantic_tags).
-        - Поймать NULL / пустые строки, сюрпризы в кейсе/пробелах.
-        - Убедиться что данные выглядят ожидаемо, ПЕРЕД тем как писать сложный SQL.
+        ## ЗОВИ ЭТОТ TOOL когда:
 
-        Возвращает Markdown-таблицу с N строками (max 20). Автоматически
-        фильтрует по последнему report_date / snapshot_date или WHERE date < today()
-        чтобы не схватить неполный текущий день.
+        - В вопросе пользователя упоминается значение, которого ты не знаешь.
+          Пример: "покажи кампании в audit-magnetto-tab2" — что такое
+          'audit-magnetto-tab2'? Возьми sample_table таблицы со столбцом
+          cabinet_name (например dm_direct_performance) — увидишь, что это
+          один из значений колонки cabinet_name. После этого сразу делегируй
+          с правильным фильтром, без гаданий типа "это файл / utm / вкладка".
+
+        - Не уверен какие литералы бывают в LowCardinality / enum-колонке
+          (cabinet_name, traffic_source, status, state, zone_status, health,
+          ad_type, и т.д.).
+
+        - Хочешь убедиться что Array-поле (goalsID, channels_path,
+          semantic_tags, priority_goal_ids) выглядит как ты думаешь — перед
+          тем как писать ARRAY JOIN или hasAny.
+
+        - Видишь странные числа в ответе подагента и хочешь спот-чек самой
+          выборки.
+
+        ## НЕ ЗОВИ когда:
+
+        - Уже знаешь ответ из data_map.md или предыдущего turn'а.
+        - Нужны агрегаты/группировки/большой SELECT — это работа подагента,
+          делегируй task() или delegate_to_generalist(). sample_table — это
+          ТОЛЬКО подсмотр 5 строк, не анализ.
+
+        ## Что возвращает
+
+        Markdown-таблица с N строками (max 20). Автофильтр по последнему
+        report_date / snapshot_date или WHERE date < today() — чтобы не
+        схватить неполный текущий день. Длинные строки усекаются до 200
+        символов, общий результат cap ~4KB.
 
         Args:
-            table_name: точное имя таблицы из ТВОЕГО schema_tables (см. system prompt).
+            table_name: точное имя таблицы (без префикса 'magnetto.').
             n: сколько строк вернуть, 1..20, по умолчанию 5.
         """
         if table_name not in allowed:
             return (
-                f"⛔ sample_table: таблица '{table_name}' не входит в твой schema_tables. "
-                f"Разрешены: {sorted(allowed) if allowed else '(пусто)'}. "
-                "Если нужно посмотреть другую — эскалируй главному агенту, он "
-                "переключит маршрут на подходящего subagent'а."
+                f"⛔ sample_table: таблица '{table_name}' недоступна в этом scope. "
+                f"Доступны: {sorted(allowed) if allowed else '(пусто)'}. "
+                "Если ты подагент — эскалируй главному агенту, чтобы он "
+                "переключил маршрут на подходящего subagent'а."
             )
 
         n = max(1, min(int(n), _MAX_N))

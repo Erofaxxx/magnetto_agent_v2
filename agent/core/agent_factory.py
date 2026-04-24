@@ -147,15 +147,22 @@ def build_agent(
         middleware=[DynamicContextMiddleware(), CachingMiddleware()],
     )
 
-    # Main agent: НЕ держит clickhouse_query, НЕ держит list_tables.
-    # Архитектурное разделение — main только роутит и пост-обрабатывает
-    # parquet через python_analysis. Все SQL идут через task(...) /
-    # delegate_to_generalist(...). Карта таблиц (data_map.md) и так в
-    # его system prompt через memory=, искать её через list_tables/glob
-    # не нужно и вредно (list_tables возвращает ~8K токенов схем).
+    # Main agent: НЕ держит clickhouse_query (нет полноценного SQL).
+    # НО держит sample_table — узкий discovery-tool на 5 строк,
+    # чтобы посмотреть значения LowCardinality колонок (cabinet_name,
+    # traffic_source, status и т.д.) когда непонятно, что именно
+    # пользователь имел в виду. Без этого main был «слепым» — гадал
+    # литералы вместо того чтобы посмотреть.
+    #
+    # allowed_tables = все таблицы SchemaCache (вся БД magnetto, как
+    # перечислено в data_map.md). Это discovery, не анализ —
+    # auto-фильтр по report_date/snapshot_date/date<today, truncation
+    # длинных строк до 200 chars, cap результата ~4KB.
+    all_tables = schema_cache.all_table_names()
     main_tools = [
         think_tool,
         python_analysis,         # post-processing of parquet returned by subagents
+        make_sample_table_tool(allowed_tables=all_tables),
         delegate_tool,
     ]
 
