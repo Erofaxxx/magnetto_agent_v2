@@ -20,8 +20,14 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 
 
 def _dynamic_block() -> str:
-    today = (datetime.now(_TZ) if _TZ else datetime.utcnow()).date().isoformat()
-    return f"\nСегодня: {today}\nНДС в РФ: 22%\n"
+    now = datetime.now(_TZ) if _TZ else datetime.utcnow()
+    today = now.date().isoformat()
+    year = now.year
+    return (
+        f"\nСегодня: {today}. Любой относительный период без года "
+        f"(«за март», «в этом месяце», «на прошлой неделе») — это {year} год.\n"
+        f"НДС в РФ: 22% (cost в витринах Директа хранится БЕЗ НДС; с НДС = cost × 1.22).\n"
+    )
 
 
 def _clone(msg, new_content):
