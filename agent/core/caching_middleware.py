@@ -59,24 +59,71 @@ _MAX_BREAKPOINTS = 4
 _CACHE_LOG = os.environ.get("CACHE_LOG", "1") != "0"
 
 
+def _unwrap_ai_message(response):
+    """
+    LangChain middleware wrap_model_call sees response as ModelResponse
+    (dataclass with .result: list[BaseMessage]) or ExtendedModelResponse
+    (wraps ModelResponse). usage lives on the last AIMessage inside .result.
+    Unwrap iteratively.
+    """
+    from langchain_core.messages import AIMessage as _AIMessage
+
+    node = response
+    for _ in range(4):  # safety bound
+        if node is None:
+            return None
+        # ExtendedModelResponse.model_response → ModelResponse
+        if hasattr(node, "model_response") and node.model_response is not None:
+            node = node.model_response
+            continue
+        # ModelResponse.result → list[BaseMessage]
+        if hasattr(node, "result"):
+            result = getattr(node, "result") or []
+            # последний AIMessage в result — тот, где usage
+            for m in reversed(result):
+                if isinstance(m, _AIMessage):
+                    return m
+            return None
+        # already an AIMessage
+        if isinstance(node, _AIMessage):
+            return node
+        # dict-shaped
+        if isinstance(node, dict):
+            res = node.get("result")
+            if isinstance(res, list):
+                for m in reversed(res):
+                    if isinstance(m, _AIMessage):
+                        return m
+            return None
+        return None
+    return None
+
+
 def _extract_cache_stats(response) -> dict:
     """
-    Try both canonical Anthropic/LangChain locations for cache usage:
-      - response.usage_metadata.input_token_details.{cache_read, cache_creation}
-      - response.response_metadata.token_usage.prompt_tokens_details.{cached_tokens, cache_write_tokens}
-    Return a normalized dict or {} if nothing found.
+    Pull cache usage out of the AIMessage inside response. Tries both
+    canonical locations:
+      - msg.usage_metadata.input_token_details.{cache_read, cache_creation}
+      - msg.response_metadata.token_usage.prompt_tokens_details.{cached_tokens, cache_write_tokens}
+    Returns normalized dict with keys: in, out, read, write.
     """
-    out = {}
-    um = getattr(response, "usage_metadata", None) or {}
+    msg = _unwrap_ai_message(response)
+    if msg is None:
+        return {}
+
+    out: dict = {}
+    um = getattr(msg, "usage_metadata", None) or {}
     if isinstance(um, dict):
         itd = um.get("input_token_details") or {}
-        out["in"] = um.get("input_tokens")
-        out["out"] = um.get("output_tokens")
+        if um.get("input_tokens") is not None:
+            out["in"] = um.get("input_tokens")
+        if um.get("output_tokens") is not None:
+            out["out"] = um.get("output_tokens")
         if itd.get("cache_read") is not None:
             out["read"] = itd.get("cache_read")
         if itd.get("cache_creation") is not None:
             out["write"] = itd.get("cache_creation")
-    rm = getattr(response, "response_metadata", None) or {}
+    rm = getattr(msg, "response_metadata", None) or {}
     if isinstance(rm, dict):
         tu = rm.get("token_usage") or {}
         ptd = tu.get("prompt_tokens_details") or {}
@@ -96,18 +143,24 @@ def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
         return
     stats = _extract_cache_stats(response)
     if not stats:
+        # Тихо: если usage недоступен — просто ничего не пишем
         return
     # Count tool/human messages for context
     n_tools = sum(1 for m in request.messages if isinstance(m, ToolMessage))
     n_humans = sum(1 for m in request.messages if isinstance(m, HumanMessage))
-    in_tok = stats.get("in", "?")
-    out_tok = stats.get("out", "?")
-    read = stats.get("read", 0) or 0
-    write = stats.get("write", 0) or 0
-    uncached = (in_tok - read - write) if isinstance(in_tok, int) else "?"
+    in_tok = stats.get("in")
+    out_tok = stats.get("out")
+    read = int(stats.get("read") or 0)
+    write = int(stats.get("write") or 0)
+    if isinstance(in_tok, int):
+        uncached = max(0, in_tok - read - write)
+    else:
+        uncached = "?"
     print(
         f"[cache {agent_name}] tools={n_tools} humans={n_humans} | "
-        f"in={in_tok} read={read} write={write} uncached={uncached} | out={out_tok}",
+        f"in={in_tok if in_tok is not None else '?'} "
+        f"read={read} write={write} uncached={uncached} | "
+        f"out={out_tok if out_tok is not None else '?'}",
         flush=True,
     )
 
