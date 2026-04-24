@@ -138,14 +138,28 @@ def make_delegate_to_generalist_tool(
     Args:
         client_dir: path to clients/<id>/
         default_model: LangChain chat model instance
-        tools_fn: callable returning list of tools (default: [clickhouse_query, python_analysis, think_tool])
+        tools_fn: callable — ЛИБО `() -> list[tool]` (legacy), ЛИБО
+                  `(tables: list[str]) -> list[tool]` (preferred) для
+                  per-call scope (sample_table с allowed_tables = tables).
+                  Default: `[clickhouse_query, python_analysis, think_tool]`.
         middleware: list of AgentMiddleware (default: [CachingMiddleware()])
 
     Returns:
         LangChain BaseTool.
     """
+    import inspect as _inspect
     middleware = middleware or [CachingMiddleware()]
-    tools_fn = tools_fn or (lambda: [clickhouse_query, python_analysis, think_tool])
+    tools_fn = tools_fn or (lambda tables=None: [clickhouse_query, python_analysis, think_tool])
+
+    # Поддержка обеих сигнатур tools_fn: с аргументом tables и без
+    def _call_tools_fn(tables: list[str]) -> list:
+        try:
+            sig = _inspect.signature(tools_fn)
+            if len(sig.parameters) >= 1:
+                return tools_fn(tables)
+        except (TypeError, ValueError):
+            pass
+        return tools_fn()
 
     @tool
     def delegate_to_generalist(
@@ -230,10 +244,11 @@ def make_delegate_to_generalist_tool(
         )
 
         # ── Build and run a one-shot agent ──────────────────────────────
+        inner_tools = _call_tools_fn(tables)
         try:
             agent = create_agent(
                 model=default_model,
-                tools=tools_fn(),
+                tools=inner_tools,
                 system_prompt=system_prompt,
                 middleware=middleware,
             )
@@ -241,7 +256,7 @@ def make_delegate_to_generalist_tool(
             # Fallback: older langchain signatures without middleware arg
             agent = create_agent(
                 model=default_model,
-                tools=tools_fn(),
+                tools=inner_tools,
                 system_prompt=system_prompt,
             )
 
