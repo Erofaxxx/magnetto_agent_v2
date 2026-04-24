@@ -25,6 +25,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from .caching_middleware import CachingMiddleware
 from .budget_middleware import BudgetMiddleware
 from .delegate_to_generalist import make_delegate_to_generalist_tool
+from .dynamic_context_middleware import DynamicContextMiddleware
 from .enforcement_middleware import HardcodeDetector, RoutingEnforcer
 from .schema_cache import get_schema_cache
 from .session_backend import make_backend_factory
@@ -125,7 +126,7 @@ def build_agent(
         client_dir=client_dir,
         default_model=llm,
         tools_fn=lambda: tool_list_subagent,
-        middleware=[CachingMiddleware()],
+        middleware=[CachingMiddleware(), DynamicContextMiddleware()],
     )
     main_tools = [
         think_tool,
@@ -153,6 +154,8 @@ def build_agent(
         existing_mw = list(spec.get("middleware") or [])
         if not any(isinstance(m, CachingMiddleware) for m in existing_mw):
             existing_mw.append(CachingMiddleware())
+        if not any(isinstance(m, DynamicContextMiddleware) for m in existing_mw):
+            existing_mw.append(DynamicContextMiddleware())
         spec["middleware"] = existing_mw
 
     # ── Checkpointer (per-process single conn) ──────────────────────────
@@ -175,12 +178,14 @@ def build_agent(
         subagents=subagent_specs,
         backend=backend_factory,
         middleware=[
-            # ORDER matters: Caching should be outermost (wraps model calls).
-            # Enforcement middleware intercepts tool calls BEFORE they execute.
+            # ORDER matters: Caching outermost (wraps model calls),
+            # DynamicContext innermost → today+VAT appended AFTER cache_control,
+            # so it stays out of cache and updates every call.
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_ITERATIONS),
             RoutingEnforcer(),       # blocks complex clickhouse_query without delegation
             HardcodeDetector(),      # blocks pd.DataFrame({...: [lits]}) patterns
+            DynamicContextMiddleware(),
         ],
         checkpointer=checkpointer,
     )
