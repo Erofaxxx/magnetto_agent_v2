@@ -143,10 +143,17 @@ def build_agent(
         tools=tool_list_subagent,
     )
     # Replace model strings with model instances (pin Anthropic provider)
+    # + attach CachingMiddleware so Anthropic prompt caching hits for subagent
+    # system prompts (schema + skills) and tool-message breakpoints. Without it
+    # every subagent call is a cache miss and burns 8–15K input tokens each time.
     for spec in subagent_specs:
         mdl = spec.get("model")
         if isinstance(mdl, str):
             spec["model"] = _build_model(mdl)
+        existing_mw = list(spec.get("middleware") or [])
+        if not any(isinstance(m, CachingMiddleware) for m in existing_mw):
+            existing_mw.append(CachingMiddleware())
+        spec["middleware"] = existing_mw
 
     # ── Checkpointer (per-process single conn) ──────────────────────────
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
