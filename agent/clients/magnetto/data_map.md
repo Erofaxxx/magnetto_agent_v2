@@ -4,6 +4,19 @@
 
 **Колонка "Skills" ниже — что передавать в `delegate_to_generalist(skills=[...])` для этой таблицы.**
 
+## Кабинеты Яндекс.Директа — что значит `cabinet_name`
+
+У клиента **четыре** рекламных кабинета. Колонка `cabinet_name` присутствует в `dm_direct_performance`, `bad_keywords`, `bad_placements`, `bad_queries`, `campaigns_settings`, `adgroups_settings`, `ads_settings`, `command_center_*`, `budget_reallocation`. Значения и проекты:
+
+| `cabinet_name` (литерал) | Проект |
+|---|---|
+| `audit-magnetto-tab1` | Costura Town |
+| `audit-magnetto-tab2` | Нити |
+| `audit-magnetto-tab3` | Риваят |
+| `audit-magnetto-tab4` | Оригана |
+
+Если пользователь упоминает **`audit-magnetto-tab<N>`** или название проекта — это **значение `cabinet_name`** в таблицах Директа. Фильтруй / группируй по этому полю. Это **НЕ** имена файлов, **НЕ** UTM-метки, **НЕ** vкладки в каком-то документе.
+
 ## Трафик и визиты (grain: traffic slice / event)
 
 - **`dm_traffic_performance`** — 1 строка = (date × project × utm × device × city). Визиты, bounce, page_views, duration + **62 goal_* колонки** (счётчики целей). ⚠ **НЕТ cost/revenue** — ROAS/CPC из этой таблицы НЕЛЬЗЯ. Для расходов используй `dm_direct_performance`.
