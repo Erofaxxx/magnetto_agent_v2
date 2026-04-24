@@ -31,6 +31,7 @@ from .exploration_tools import make_sample_table_tool
 from .schema_cache import get_schema_cache
 from .session_backend import make_backend_factory
 from .subagent_loader import load_subagents
+from .tool_exclusion_middleware import ToolExclusionMiddleware
 from .tools import clickhouse_query, list_tables, python_analysis, think_tool
 
 
@@ -146,13 +147,15 @@ def build_agent(
         middleware=[DynamicContextMiddleware(), CachingMiddleware()],
     )
 
-    # Main agent: НЕ держит clickhouse_query. Архитектурное разделение —
-    # main только роутит и пост-обрабатывает parquet через python_analysis.
-    # Все SQL идут через task(...) / delegate_to_generalist(...).
+    # Main agent: НЕ держит clickhouse_query, НЕ держит list_tables.
+    # Архитектурное разделение — main только роутит и пост-обрабатывает
+    # parquet через python_analysis. Все SQL идут через task(...) /
+    # delegate_to_generalist(...). Карта таблиц (data_map.md) и так в
+    # его system prompt через memory=, искать её через list_tables/glob
+    # не нужно и вредно (list_tables возвращает ~8K токенов схем).
     main_tools = [
         think_tool,
         python_analysis,         # post-processing of parquet returned by subagents
-        list_tables,             # резерв для роутинга «а есть ли такая витрина»
         delegate_tool,
     ]
 
@@ -220,6 +223,12 @@ def build_agent(
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_ITERATIONS),
             HardcodeDetector(),      # blocks pd.DataFrame({...: [lits]}) patterns
+            # Убираем у main ненужные tools от встроенной FilesystemMiddleware.
+            # glob/grep/ls провоцировали fallback-поведение (main искал
+            # data_map.md как внешний файл, хотя он уже в system prompt).
+            # read_file / write_file / edit_file оставляем — они нужны для
+            # /memories/ и /plots/ (хотя редко используются).
+            ToolExclusionMiddleware(excluded={"glob", "grep", "ls"}),
         ],
         checkpointer=checkpointer,
     )
