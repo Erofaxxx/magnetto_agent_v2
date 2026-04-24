@@ -55,8 +55,17 @@ _OPENROUTER_HEADERS = {
 def _build_model(model_name: str) -> ChatOpenAI:
     """
     ChatOpenAI configured for OpenRouter with Anthropic provider pinning.
-    Pinning is critical — without it OpenRouter round-robins across Anthropic
+    Pinning is critical — без него OpenRouter round-robins across Anthropic
     edges, and each edge has its own prompt cache → cache miss every time.
+
+    Кэширование — top-level `cache_control` в extra_body (OpenRouter automatic
+    caching). Anthropic сам двигает breakpoint в конец сообщений на каждом
+    запросе, так что растущая tool-цепочка инкрементально расширяет кэш без
+    ручной расстановки маркеров. TTL 5 минут (1.25× write, 0.1× read).
+
+    Important: top-level cache_control обходит баг langchain_openai
+    (`_sanitize_chat_completions_content` срезает cache_control с ToolMessage
+    content blocks). Top-level поле не трогается санитайзером.
     """
     if not _OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not set")
@@ -74,6 +83,7 @@ def _build_model(model_name: str) -> ChatOpenAI:
                 "order": ["Anthropic"],
                 "allow_fallbacks": False,
             },
+            "cache_control": {"type": "ephemeral"},
         }
     return ChatOpenAI(**kwargs)
 
@@ -141,9 +151,10 @@ def build_agent(
         client_dir=client_dir,
         default_model=llm,
         tools_fn=_make_subagent_tools,
-        # ORDER: DynamicContext first (outermost) → today+VAT запечатаны В system
-        # prompt ДО cache_control, поэтому сидят внутри кэша. Один cache-miss
-        # в сутки в полночь МСК, дальше cache read.
+        # DynamicContext дописывает today+VAT в system prompt — попадает
+        # внутрь auto-кэша вместе со схемами/skills. Один cache-miss в сутки
+        # в полночь МСК, дальше cache read. CachingMiddleware теперь только
+        # логирует usage stats (cache_control стоит в extra_body модели).
         middleware=[DynamicContextMiddleware(), CachingMiddleware()],
     )
 
@@ -174,13 +185,12 @@ def build_agent(
         default_model=llm,
         tools=_make_subagent_tools,
     )
-    # Replace model strings with model instances (pin Anthropic provider).
+    # Replace model strings with model instances (pin Anthropic provider +
+    # auto-cache в extra_body — см. _build_model).
     #
-    # Middleware order (outermost → innermost): DynamicContext + Caching.
-    # DynamicContext FIRST так, чтобы today+VAT упаковались В system prompt
-    # ДО того, как CachingMiddleware поставит cache_control. Подагент видит
-    # actual дату как часть своего system prompt, и этот блок кэшируется
-    # вместе с остальной стабильной частью (schema + skills).
+    # DynamicContext FIRST: today+VAT попадают в system prompt ДО вызова
+    # модели и автоматически оказываются в auto-кэше Anthropic.
+    # CachingMiddleware — только лог usage stats.
     for spec in subagent_specs:
         mdl = spec.get("model")
         if isinstance(mdl, str):
@@ -214,14 +224,15 @@ def build_agent(
         backend=backend_factory,
         middleware=[
             # ORDER (outermost → innermost):
-            # 1) DynamicContext FIRST — добавляет today+VAT в system prompt,
-            #    ДО того как Caching поставит cache_control. Блок становится
-            #    жёсткой частью системной инструкции и лежит ВНУТРИ кэша.
-            #    Cache miss 1 раз в сутки при смене даты — терпимо.
-            # 2) Caching — ставит cache_control на: последний блок system
-            #    (включая today+VAT), последний ToolMessage (граница истории),
-            #    последний HumanMessage (свежий пользовательский ввод).
-            #    Всё это кэшируется на 5 мин Anthropic ephemeral TTL.
+            # 1) DynamicContext — добавляет today+VAT в system prompt. Auto-кэш
+            #    Anthropic (см. _build_model.extra_body.cache_control) включает
+            #    этот блок в кэшируемый префикс. Cache miss 1 раз в сутки при
+            #    смене даты — терпимо.
+            # 2) Caching — purely logging now. Печатает usage stats
+            #    (read/write/uncached) после каждого model call в journalctl.
+            #    Расстановка cache_control больше не нужна — top-level
+            #    cache_control в extra_body модели делает это автоматически
+            #    и обходит баг langchain_openai с санитайзингом ToolMessage.
             # 3) HardcodeDetector — ловит pd.DataFrame({...: [литералы]}) в
             #    python_analysis, на wrap_tool_call.
             # RoutingEnforcer убран: main физически не имеет clickhouse_query,
