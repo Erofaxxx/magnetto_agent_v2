@@ -89,6 +89,20 @@ def load_subagents(
         description = meta.get("description", "") or ""
         schema_tables = meta.get("schema_tables", []) or []
 
+        # Sanity check: предупредить если какая-то таблица из schema_tables
+        # отсутствует в SchemaCache (опечатка в SUBAGENT.md, таблицу удалили
+        # из CH, или у User_magnetto нет GRANT SELECT). Это не ошибка — subagent
+        # поднимется без этой таблицы в схеме, но SQL против неё упадёт.
+        if schema_tables:
+            known = set(schema_cache.all_table_names())
+            missing = [t for t in schema_tables if t not in known]
+            if missing:
+                print(
+                    f"⚠ subagent_loader[{name}]: schema_tables отсутствуют в SchemaCache: "
+                    f"{missing}. Проверь опечатки в SUBAGENT.md, удалена ли таблица "
+                    f"в CH, и что у CLICKHOUSE_USER есть GRANT SELECT."
+                )
+
         # Render schema section
         if schema_tables:
             schema_section = schema_cache.render_schema_section(schema_tables)
