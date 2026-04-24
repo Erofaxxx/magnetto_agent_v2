@@ -1,18 +1,38 @@
 """
 CachingMiddleware — ставит `cache_control: ephemeral` на стабильные блоки
-system prompt и messages, чтобы Anthropic prompt caching через OpenRouter
-работал оптимально.
+system prompt и messages, чтобы Anthropic prompt caching работал на полную
+глубину tool-chain'а.
 
-Модель кэша (до 4 breakpoints у Anthropic):
-  1. System prompt (стабильный: AGENTS.md + data_map.md + skills index) — всегда
-  2. Последний ToolMessage / AIMessage старше last-user — «история до текущего turn»
-  3. Последний HumanMessage — граница между кэшем и новым вводом пользователя
+Anthropic разрешает **до 4 cache_control маркеров в одном запросе**.
+Используем все 4, чтобы получить rolling incremental cache внутри turn'а:
+
+  1. System prompt (последний блок). Самая стабильная часть — AGENTS.md +
+     data_map.md + skills index + SUBAGENT.md body + schema_section + блок
+     «Сегодня + НДС». Меняется только в полночь (новая дата), всё остальное
+     время byte-stable → кэш живёт.
+
+  2. Последний HumanMessage. Граница «история до текущего turn». В пределах
+     одного turn'а не сдвигается.
+
+  3. Предпоследний ToolMessage (если есть). Ключевая точка для rolling
+     window: на шаге N+1 он уже был «последним ToolMessage» на шаге N,
+     Anthropic записал кэш до этой позиции на шаге N, и на шаге N+1
+     Anthropic находит hit до этой позиции через prefix match.
+
+  4. Последний ToolMessage. Новый «конец известного мира» — кэш пишется
+     только на дельту между (3) и (4) — это обычно один свежий tool_result.
+
+Итог: каждый следующий model_call читает из кэша всё до предпоследнего
+ToolMessage, пишет только последний tool_result. Без этой схемы (до фикса)
+на каждом шаге переписывался ВЕСЬ накопленный tool-chain, потому что
+маркер был только на самом свежем tool_result, а Anthropic проверяет hits
+только на позициях текущих маркеров.
 
 Правила:
   - Работает только если модель — Anthropic (детектится по имени).
   - Для не-Anthropic (DeepSeek, OpenAI) не делает ничего.
   - Не модифицирует сам текст, только оборачивает content в блочный формат
-    с cache_control.
+    с cache_control (метаданные, не участвуют в хэше кэш-ключа).
 
 Использование:
   create_deep_agent(
@@ -28,6 +48,10 @@ from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+
+# Anthropic hard limit — не более 4 cache_control маркеров в одном запросе.
+_MAX_BREAKPOINTS = 4
 
 
 def _is_anthropic(model: Any) -> bool:
@@ -88,89 +112,83 @@ def _clone_message_with_content(msg, new_content):
         return out
 
 
+def _apply_breakpoints(request: ModelRequest) -> None:
+    """
+    Shared logic for sync/async wrap_model_call. Mutates `request` in-place:
+      - attaches cache_control to the last block of system_message (breakpoint #1)
+      - attaches cache_control to up to TWO last ToolMessage positions
+        (breakpoints #2 and #3 — rolling window for tool-chain)
+      - attaches cache_control to the last HumanMessage (breakpoint #4)
+
+    Total ≤ 4, within Anthropic's hard limit.
+    """
+    # ── 1. System prompt breakpoint ───────────────────────────────────────
+    if request.system_message is not None:
+        content = request.system_message.content
+        new_content = _attach_cache_control(content)
+        if new_content is not content:
+            request.system_message = _clone_message_with_content(
+                request.system_message, new_content
+            )
+
+    # ── 2-4. Messages: last HumanMessage + last TWO ToolMessage'ей ────────
+    msgs = list(request.messages)
+
+    # Все индексы ToolMessage в порядке появления
+    tool_indices = [i for i, m in enumerate(msgs) if isinstance(m, ToolMessage)]
+
+    # Последний HumanMessage
+    last_human_idx = next(
+        (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], HumanMessage)),
+        None,
+    )
+
+    # Соберём позиции для маркеров (ставим на 2 последних ToolMessage +
+    # последний HumanMessage). Это максимум 3 маркера в messages + 1 system
+    # = 4, укладываемся в Anthropic лимит.
+    positions_to_mark: list[int] = []
+    positions_to_mark.extend(tool_indices[-2:])           # последние 2 ToolMessage
+    if last_human_idx is not None:
+        positions_to_mark.append(last_human_idx)
+
+    # Дедуплицируем (на всякий — теоретически последний human не может быть
+    # tool, но защищаемся) и применяем маркеры.
+    marked: set[int] = set()
+    for idx in positions_to_mark:
+        if idx in marked:
+            continue
+        msg = msgs[idx]
+        new_c = _attach_cache_control(msg.content)
+        if new_c is not msg.content:
+            msgs[idx] = _clone_message_with_content(msg, new_c)
+            marked.add(idx)
+
+    request.messages = msgs
+
+
 class CachingMiddleware(AgentMiddleware):
     """
-    Attach `cache_control: ephemeral` to:
-      1. System prompt (last block).
-      2. Last ToolMessage among messages (so tool-call chain is cached).
-      3. Last HumanMessage (boundary between cached history and fresh input).
+    Attach `cache_control: ephemeral` strategically on up to 4 positions:
+      1. System prompt (last block)
+      2. Previous-to-last ToolMessage  (rolling-window anchor)
+      3. Last ToolMessage              (current tool-chain tip)
+      4. Last HumanMessage             (turn boundary)
+
+    With (2) in place, each successive model_call in a tool-chain reads from
+    cache up to the previous ToolMessage and writes only the delta (one new
+    tool_result). Before this change only (3) was marked, so Anthropic could
+    only find cache-hit up to HumanMessage — causing the whole accumulated
+    tool-chain to be re-written on every step.
     """
 
     def wrap_model_call(self, request: ModelRequest, handler):
         if not _is_anthropic(request.model):
             return handler(request)
-
-        # ── 1. System prompt breakpoint ────────────────────────────────────
-        if request.system_message is not None:
-            content = request.system_message.content
-            new_content = _attach_cache_control(content)
-            if new_content is not content:
-                request.system_message = _clone_message_with_content(
-                    request.system_message, new_content
-                )
-
-        # ── 2+3. Messages: last ToolMessage + last HumanMessage ────────────
-        msgs = list(request.messages)
-        last_tool_idx = next(
-            (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], ToolMessage)),
-            None,
-        )
-        last_human_idx = next(
-            (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], HumanMessage)),
-            None,
-        )
-
-        # Avoid double-marking a single message (if last human is also the last message
-        # and there's no tool before it, the system+1 breakpoint is enough).
-        marked: set[int] = set()
-        if last_tool_idx is not None and last_tool_idx != last_human_idx:
-            tm = msgs[last_tool_idx]
-            new_c = _attach_cache_control(tm.content)
-            if new_c is not tm.content:
-                msgs[last_tool_idx] = _clone_message_with_content(tm, new_c)
-                marked.add(last_tool_idx)
-        if last_human_idx is not None and last_human_idx not in marked:
-            hm = msgs[last_human_idx]
-            new_c = _attach_cache_control(hm.content)
-            if new_c is not hm.content:
-                msgs[last_human_idx] = _clone_message_with_content(hm, new_c)
-
-        request.messages = msgs
+        _apply_breakpoints(request)
         return handler(request)
 
     async def awrap_model_call(self, request: ModelRequest, handler):
         if not _is_anthropic(request.model):
             return await handler(request)
-
-        if request.system_message is not None:
-            content = request.system_message.content
-            new_content = _attach_cache_control(content)
-            if new_content is not content:
-                request.system_message = _clone_message_with_content(
-                    request.system_message, new_content
-                )
-
-        msgs = list(request.messages)
-        last_tool_idx = next(
-            (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], ToolMessage)),
-            None,
-        )
-        last_human_idx = next(
-            (i for i in range(len(msgs) - 1, -1, -1) if isinstance(msgs[i], HumanMessage)),
-            None,
-        )
-        marked: set[int] = set()
-        if last_tool_idx is not None and last_tool_idx != last_human_idx:
-            tm = msgs[last_tool_idx]
-            new_c = _attach_cache_control(tm.content)
-            if new_c is not tm.content:
-                msgs[last_tool_idx] = _clone_message_with_content(tm, new_c)
-                marked.add(last_tool_idx)
-        if last_human_idx is not None and last_human_idx not in marked:
-            hm = msgs[last_human_idx]
-            new_c = _attach_cache_control(hm.content)
-            if new_c is not hm.content:
-                msgs[last_human_idx] = _clone_message_with_content(hm, new_c)
-
-        request.messages = msgs
+        _apply_breakpoints(request)
         return await handler(request)
