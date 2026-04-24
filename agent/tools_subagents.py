@@ -1,9 +1,10 @@
 """
 Sub-agent tool wrappers for the main AnalyticsAgent.
 
-Two tools that delegate specialised queries to sub-agents:
-  - ask_direct_optimizer  → DirectOptimizerAgent
-  - ask_scoring_agent     → ScoringIntelligenceAgent
+Three tools that delegate specialised queries to sub-agents:
+  - ask_direct_optimizer   → DirectOptimizerAgent
+  - ask_scoring_agent      → ScoringIntelligenceAgent
+  - ask_command_center     → CommandCenterAgent
 
 Each tool returns (content, artifacts) via response_format="content_and_artifact"
 so plots created by sub-agents are delivered to the user.
@@ -48,6 +49,55 @@ def ask_direct_optimizer(query: str) -> tuple[str, list[str]]:
 
     if not result.get("success"):
         error_msg = result.get("error", "Unknown error in DirectOptimizerAgent")
+        return json.dumps({"success": False, "error": error_msg}), []
+
+    text = result.get("text_output", "")
+    plots = result.get("plots", [])
+
+    content = json.dumps({
+        "success": True,
+        "text_output": text,
+        "tool_calls_count": len(result.get("tool_calls", [])),
+    }, ensure_ascii=False)
+
+    return content, plots
+
+
+@tool(response_format="content_and_artifact")
+def ask_command_center(query: str) -> tuple[str, list[str]]:
+    """
+    Делегировать вопрос подагенту командного центра (дневные snapshot-витрины портфеля).
+
+    Подагент работает с таблицами:
+    • command_center_campaigns — портфель кампаний: health (green/yellow/red/pending), week vs prev, ROAS, CPA, weekly_budget, priority_goal_ids/values, history_* за 12 недель.
+    • command_center_adgroups — группы: health, keyword_count, autotargeting_*, spam_traffic, drill в конкретную кампанию.
+    • command_center_ads — объявления: креатив, модерация (vcard_moderation, ad_image_moderation, sitelinks_moderation), REJECTED-статус, drill в группу.
+    • budget_reallocation — рекомендованный vs фактический недельный бюджет, zone_status, forecast.
+
+    Используй когда вопрос касается:
+    - Состояния портфеля «прямо сейчас»: какие кампании в красной зоне, health_counts, что поменялось за неделю.
+    - Drill-down: «почему у кампании X spam 40%», «что с группой Y», «какое объявление ворует бюджет».
+    - Сравнения week vs prev: кто вырос/упал по cost/clicks/leads/orders.
+    - Бюджета vs факта: `cost_week > weekly_budget`, перерасход по портфелю.
+    - Интерпретации брифинга от «выделения области на дашборде /budget» (есть секции «Где находится пользователь / Выделенные карточки / Сырой текст»).
+    - Приоритетных целей (`priority_goal_ids`/`priority_goal_values`) кампании и их ценностей.
+    - Отклонённых объявлений и проблем модерации.
+
+    НЕ используй для:
+    - Сырого анализа ключевых слов, площадок, минус-слов, bid_zone, is_chronic — это ask_direct_optimizer (bad_keywords/bad_placements/bad_queries).
+    - Истории глубже 12 недель — в command_center_* только агрегат по weekly snapshot; сырые данные — direct-optimizer через dm_direct_performance.
+    - Скоринга клиентов, ретаргета, lift-анализа целей — это ask_scoring_agent.
+
+    Args:
+        query: Полный вопрос пользователя. Передай как есть, без изменений.
+    """
+    from subagents.command_center import get_command_center_agent
+
+    agent = get_command_center_agent()
+    result = agent.run(query)
+
+    if not result.get("success"):
+        error_msg = result.get("error", "Unknown error in CommandCenterAgent")
         return json.dumps({"success": False, "error": error_msg}), []
 
     text = result.get("text_output", "")

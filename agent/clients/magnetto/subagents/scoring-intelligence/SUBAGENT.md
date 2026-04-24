@@ -9,7 +9,8 @@ description: |
   (report_daily_briefing).
   НЕ используй для: рекламы Директа (direct-optimizer),
   общего трафика/клиентского профиля (generalist + dm_client_profile / dm_traffic_performance),
-  атрибуции по каналам (generalist + dm_conversion_paths).
+  атрибуции по каналам (generalist + dm_conversion_paths),
+  состояния дашборда командного центра (command-center).
 model: anthropic/claude-sonnet-4.6
 schema_tables:
   - dm_active_clients_scoring
