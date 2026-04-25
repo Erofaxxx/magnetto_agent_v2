@@ -3,11 +3,14 @@ Deep Agents core — фабрики, middleware, инструменты.
 
 Architecture:
   - agent_factory.build_agent(session_id, client_id) → CompiledStateGraph
-  - Main agent: карта данных + skills index, без clickhouse_query для доменов
-  - Specialized subagents: direct-optimizer, scoring-intelligence (фикс. schema+skills)
-  - Generalist subagent: создаётся on-demand через delegate_to_generalist tool
+  - Main agent (thin orchestrator): карта данных + skills index, БЕЗ
+    clickhouse_query. Все запросы через task() в подагенты.
+  - Subagents (declarative из SUBAGENT.md): direct-optimizer,
+    scoring-intelligence, command-center (scoped schema+skills),
+    generalist (доступ ко всем таблицам через discovery tools).
   - Session-scoped filesystem: /parquet/, /plots/, /memories/
-  - Prompt caching: 3 breakpoints через CachingMiddleware
+  - Prompt caching: OpenRouter automatic via top-level cache_control в
+    extra_body. CachingMiddleware — pure logger usage stats.
   - Iteration budget: 30 total через BudgetMiddleware
 """
 

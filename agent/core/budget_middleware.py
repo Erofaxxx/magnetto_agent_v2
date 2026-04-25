@@ -2,7 +2,7 @@
 BudgetMiddleware — глобальный счётчик tool-итераций (включая subagents).
 
 Цель: ограничить суммарное число вызовов инструментов на одну пользовательскую
-задачу (main + все вложенные task/delegate_to_generalist вызовы).
+задачу (main + все вложенные task() вызовы).
 
 Mechanism:
   - Per-thread счётчик в модульной переменной (thread_id → int).

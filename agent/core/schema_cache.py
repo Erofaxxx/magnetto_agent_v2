@@ -4,7 +4,7 @@ Singleton in-process cache для схем таблиц ClickHouse.
 Используется:
   - specialized subagents (direct-optimizer, scoring-intelligence) — при старте
     рендерят свой schema_section из этого кэша
-  - delegate_to_generalist tool — при каждом вызове рендерит schema_section
+  - generalist subagent — schema_tables: ["*"], получает все таблицы
     на лету из tables, переданных main agent'ом
 
 Обновление: при рестарте процесса (для прод это достаточно — systemctl restart
@@ -134,6 +134,82 @@ class SchemaCache:
         for i, c in enumerate(cols, 1):
             lines.append(f"| {i} | `{c['name']}` | `{c.get('type', '')}` |")
         return "\n".join(lines)
+
+
+# ─── Compact data_map renderer ───────────────────────────────────────────────
+
+def render_data_map_compact(data_map_path) -> str:
+    """
+    Парсит `data_map.md` и возвращает компактный каталог: имя_таблицы +
+    первая строка описания. Используется в system prompt'е generalist'а
+    как замена полного data_map.md (5K → ~1K токенов).
+
+    Формат входа (паттерн из существующего data_map.md):
+        ## Section heading
+        - **`table_name`** — описание таблицы. Может содержать ⚠ маркеры
+          и переносы строк.
+          Skills: `clickhouse-basics`, ...   ← эта строка отсекается
+
+    Формат выхода (детерминированный, для cache stability):
+        - `table_name`: описание (1 строка, до 220 chars)
+
+    Группировка по разделам (## headings) сохраняется. Skills-строки и
+    markdown-форматирование убираются.
+
+    Args:
+        data_map_path: pathlib.Path или str с полным data_map.md
+
+    Returns:
+        Markdown-строка компактного каталога. Если файл не найден —
+        возвращает сообщение об ошибке (не падает, чтобы не ломать subagent).
+    """
+    from pathlib import Path
+    import re
+
+    path = Path(data_map_path) if not isinstance(data_map_path, Path) else data_map_path
+    if not path.exists():
+        return f"⚠ data_map не найден по пути: {path}"
+
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    # Pattern для table-bullet: `- **\`table_name\`** — description...`
+    table_re = re.compile(r"^\s*-\s+\*\*`([a-zA-Z_][\w]*)`\*\*\s*[—–-]\s*(.*)$")
+    # Section heading: `## Section name`
+    section_re = re.compile(r"^##\s+(.+)$")
+
+    out_lines: list[str] = []
+    current_section: str | None = None
+    section_emitted: set[str] = set()
+
+    for raw in lines:
+        # Section heading
+        m_sec = section_re.match(raw)
+        if m_sec:
+            current_section = m_sec.group(1).strip()
+            continue
+        # Table bullet
+        m_tab = table_re.match(raw)
+        if m_tab:
+            tname = m_tab.group(1)
+            desc = m_tab.group(2).strip()
+            # Strip markdown emphasis markers (** _ `)
+            desc = re.sub(r"`([^`]+)`", r"\1", desc)
+            desc = re.sub(r"\*\*([^*]+)\*\*", r"\1", desc)
+            # Truncate to one logical line
+            desc = desc.split("\n")[0].strip()
+            if len(desc) > 220:
+                desc = desc[:217] + "..."
+            # Emit section header once
+            if current_section and current_section not in section_emitted:
+                out_lines.append(f"\n### {current_section}")
+                section_emitted.add(current_section)
+            out_lines.append(f"- `{tname}`: {desc}")
+
+    if not out_lines:
+        return "⚠ data_map пустой или не распознан парсером."
+
+    return "\n".join(out_lines).strip()
 
 
 # ─── Convenience ─────────────────────────────────────────────────────────────

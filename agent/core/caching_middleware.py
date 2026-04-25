@@ -112,6 +112,24 @@ def _extract_cache_stats(response) -> dict:
     return out
 
 
+def _short_session_id() -> str:
+    """
+    Достаём session_id из ContextVar (выставляется api_server'ом перед
+    invoke). Возвращаем короткую форму (первые 8 символов) — этого хватает
+    чтобы grep'ить логи одной сессии без переполнения строки.
+    Если нет контекста (например, тест) — возвращаем '-'.
+    """
+    try:
+        from .session_context import get_current_session
+        ctx = get_current_session()
+        if ctx is None:
+            return "-"
+        sid = getattr(ctx, "session_id", None) or ""
+        return sid[:8] if sid else "-"
+    except Exception:
+        return "-"
+
+
 def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
     if not _CACHE_LOG:
         return
@@ -129,8 +147,10 @@ def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
         uncached = max(0, in_tok - read - write)
     else:
         uncached = "?"
+    sid = _short_session_id()
     print(
-        f"[cache {agent_name}] tools={n_tools} humans={n_humans} | "
+        f"[cache session={sid} agent={agent_name}] "
+        f"tools={n_tools} humans={n_humans} | "
         f"in={in_tok if in_tok is not None else '?'} "
         f"read={read} write={write} uncached={uncached} | "
         f"out={out_tok if out_tok is not None else '?'}",
@@ -140,17 +160,21 @@ def _log_cache(agent_name: str, request: ModelRequest, response) -> None:
 
 def _agent_name_from_request(request: ModelRequest) -> str:
     """
-    Best-effort label: main / sub / agent. В ModelRequest прямого имени нет,
-    используем косвенные признаки — есть ли в request.tools 'task' или
-    'delegate_to_generalist' (только у main), 'sample_table' (subagent).
+    Best-effort label: main / sub / agent.
+
+    В ModelRequest нет имени напрямую — определяем по составу tools:
+      - 'task' в tools → главный агент (deepagents auto-injects task tool
+        только в main)
+      - 'sample_table' / 'describe_table' / 'clickhouse_query' → подагент
+      - иначе → 'agent'
     """
     try:
         tool_names = {getattr(t, "name", "") for t in (request.tools or [])}
         if "task" in tool_names:
             return "main"
-        if "delegate_to_generalist" in tool_names:
-            return "main"
-        if "sample_table" in tool_names:
+        if "clickhouse_query" in tool_names:
+            return "sub"
+        if "sample_table" in tool_names or "describe_table" in tool_names:
             return "sub"
         return "agent"
     except Exception:

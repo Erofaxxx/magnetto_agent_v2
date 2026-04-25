@@ -243,8 +243,20 @@ def _extract_tool_calls(messages: list) -> list[dict]:
                         entry["plots_count"] = data.get("plots_count")
                         if not data.get("success"):
                             entry["error"] = data.get("error", "")
-                    elif name == "delegate_to_generalist":
-                        entry["tool_calls_count"] = data.get("tool_calls_count")
+                    elif name == "task":
+                        # deepagents standard subagent delegation. Subagent name
+                        # лежит в args (subagent_type/name); tool_calls_count
+                        # subagent передаёт в JSON-сериализованном response_format
+                        # (если задан) либо в free-form output.
+                        entry["subagent"] = (
+                            data.get("subagent")
+                            or data.get("name")
+                            or args.get("subagent_type")
+                            or args.get("name")
+                        )
+                        if isinstance(data, dict) and "used_tables" in data:
+                            entry["used_tables"] = data.get("used_tables")
+                            entry["used_skills"] = data.get("used_skills")
                 except Exception:
                     entry["output_raw"] = str(tm.content)[:500]
             tool_calls.append(entry)
