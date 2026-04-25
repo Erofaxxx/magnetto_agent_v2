@@ -64,22 +64,41 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 def _resolve_response_format(spec_path: str):
     """
     Резолвит строку вида `response_models.SubagentResult` в Python-класс.
-    Импорт всегда из пакета `agent.core` (где живут модули). Если резолв
-    падает — возвращаем None и предупреждаем (subagent поднимется без
-    structured output, что не критично).
+
+    Стратегия импорта (try в порядке):
+      1. Относительный из текущего пакета (`__package__` этого файла; в
+         runtime сервиса это будет 'core' — модули грузятся как core.x
+         потому что cwd = agent/).
+      2. Относительный из 'agent.core' (если кто-то запускает с верхним
+         cwd).
+      3. Bare top-level import.
+
+    Если резолв падает — возвращаем None и предупреждаем (subagent
+    поднимется без structured output).
     """
     try:
         if "." not in spec_path:
             print(f"⚠ subagent_loader: response_format '{spec_path}' must be 'module.Class'")
             return None
         mod_path, cls_name = spec_path.rsplit(".", 1)
-        # Try relative import first (most common: agent.core.response_models)
+        last_exc: Exception | None = None
+        for pkg in (__package__, "agent.core", "core"):
+            if not pkg:
+                continue
+            try:
+                mod = importlib.import_module(f".{mod_path}", package=pkg)
+                return getattr(mod, cls_name)
+            except (ImportError, ValueError, ModuleNotFoundError, AttributeError) as exc:
+                last_exc = exc
+                continue
+        # Last resort: bare module
         try:
-            mod = importlib.import_module(f".{mod_path}", package="agent.core")
-        except (ImportError, ValueError):
-            # Fallback: try as bare module (covers different runtime layouts)
             mod = importlib.import_module(mod_path)
-        return getattr(mod, cls_name)
+            return getattr(mod, cls_name)
+        except Exception as exc:
+            last_exc = exc
+        print(f"⚠ subagent_loader: failed to resolve response_format '{spec_path}': {last_exc}")
+        return None
     except Exception as exc:
         print(f"⚠ subagent_loader: failed to resolve response_format '{spec_path}': {exc}")
         return None
