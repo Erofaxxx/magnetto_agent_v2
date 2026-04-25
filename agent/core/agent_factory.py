@@ -2,13 +2,18 @@
 build_agent(session_id, client_id) — фабрика главного deepagents агента.
 
 Собирает:
-  - Main agent с tools: clickhouse_query (редко), python_analysis (post-process),
-    list_tables (резерв), think_tool, delegate_to_generalist
+  - Main agent: thin orchestrator. Tools: think_tool, python_analysis (для
+    post-processing parquet), sample_table (discovery 5 строк), describe_table.
+    `task` tool появляется автоматически от deepagents SubAgentMiddleware и
+    позволяет делегировать одному из 4 подагентов.
+    БЕЗ clickhouse_query — любой полноценный SQL только через task().
   - Memory: AGENTS.md + data_map.md (всегда в system prompt через MemoryMiddleware)
   - Skills: clients/<id>/skills/ + shared_skills/ (progressive disclosure)
-  - Subagents: direct-optimizer + scoring-intelligence (из SUBAGENT.md)
+  - Subagents (declarative из SUBAGENT.md): direct-optimizer, scoring-intelligence,
+    command-center, generalist (≈ замена бывшего custom delegate_to_generalist).
   - Backend: session-scoped CompositeBackend (/parquet/, /plots/, /memories/)
-  - Middleware: CachingMiddleware + BudgetMiddleware
+  - Middleware: DynamicContext, Caching (logging only — auto-cache настроен в
+    extra_body модели), Budget, HardcodeDetector, ToolExclusion.
   - Checkpointer: SqliteSaver (как в старом агенте, для истории диалогов)
 """
 from __future__ import annotations
@@ -24,10 +29,9 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .caching_middleware import CachingMiddleware
 from .budget_middleware import BudgetMiddleware
-from .delegate_to_generalist import make_delegate_to_generalist_tool
 from .dynamic_context_middleware import DynamicContextMiddleware
 from .enforcement_middleware import HardcodeDetector
-from .exploration_tools import make_sample_table_tool
+from .exploration_tools import make_describe_table_tool, make_sample_table_tool
 from .schema_cache import get_schema_cache
 from .session_backend import make_backend_factory
 from .subagent_loader import load_subagents
@@ -132,54 +136,51 @@ def build_agent(
     # ── Session-scoped backend factory ───────────────────────────────────
     backend_factory = make_backend_factory(client_id=client_id)
 
-    # ── Tools for subagents & generalist (per-subagent scope) ───────────
-    # Фабрика: для каждого subagent / generalist собираем список tools
-    # с персональным sample_table, scoped на его schema_tables.
+    # ── Tools for subagents (per-subagent scope) ────────────────────────
+    # Фабрика: для каждого subagent собираем список tools с персональным
+    # scope (sample_table + describe_table работают только с allowed_tables).
     # Это не даёт подагенту заглядывать в таблицы чужой доменной зоны.
+    # Для generalist'а subagent_loader разворачивает schema_tables: ["*"]
+    # в полный список — он получает доступ ко всем таблицам.
     def _make_subagent_tools(schema_tables: list[str]) -> list:
+        scope = schema_tables or []
         return [
             clickhouse_query,
             python_analysis,
             think_tool,
-            make_sample_table_tool(allowed_tables=schema_tables or []),
+            make_sample_table_tool(allowed_tables=scope),
+            make_describe_table_tool(allowed_tables=scope),
         ]
 
-    # delegate_to_generalist: tables передаются тем же путём — generalist
-    # получает sample_table только по тем таблицам, что главный агент
-    # явно указал в tables=[...].
-    delegate_tool = make_delegate_to_generalist_tool(
-        client_dir=client_dir,
-        default_model=llm,
-        tools_fn=_make_subagent_tools,
-        # DynamicContext дописывает today+VAT в system prompt — попадает
-        # внутрь auto-кэша вместе со схемами/skills. Один cache-miss в сутки
-        # в полночь МСК, дальше cache read. CachingMiddleware теперь только
-        # логирует usage stats (cache_control стоит в extra_body модели).
-        middleware=[DynamicContextMiddleware(), CachingMiddleware()],
-    )
-
-    # Main agent: НЕ держит clickhouse_query (нет полноценного SQL).
-    # НО держит sample_table — узкий discovery-tool на 5 строк,
-    # чтобы посмотреть значения LowCardinality колонок (cabinet_name,
-    # traffic_source, status и т.д.) когда непонятно, что именно
-    # пользователь имел в виду. Без этого main был «слепым» — гадал
-    # литералы вместо того чтобы посмотреть.
+    # Main agent: thin orchestrator. БЕЗ clickhouse_query, БЕЗ
+    # delegate_to_generalist (заменён на generalist subagent через task()).
     #
-    # allowed_tables = все таблицы SchemaCache (вся БД magnetto, как
-    # перечислено в data_map.md). Это discovery, не анализ —
-    # auto-фильтр по report_date/snapshot_date/date<today, truncation
-    # длинных строк до 200 chars, cap результата ~4KB.
+    # Tools у main:
+    # - think_tool — дисциплина мышления перед делегированием
+    # - python_analysis — post-processing parquet, возвращённого подагентом
+    #   (когорты, мерж двух parquet, доп. графики; SQL не пишет)
+    # - sample_table — discovery 5 строк по любой таблице (для уточнения
+    #   значения cabinet_name/traffic_source/etc. перед формулированием task)
+    # - describe_table — посмотреть схему таблицы перед формулированием task
+    #
+    # `task` tool появляется автоматически от deepagents SubAgentMiddleware
+    # с описанием всех зарегистрированных подагентов (direct-optimizer,
+    # scoring-intelligence, command-center, generalist).
     all_tables = schema_cache.all_table_names()
     main_tools = [
         think_tool,
         python_analysis,         # post-processing of parquet returned by subagents
         make_sample_table_tool(allowed_tables=all_tables),
-        delegate_tool,
+        make_describe_table_tool(allowed_tables=all_tables),
     ]
 
-    # ── Subagents (specialized) ─────────────────────────────────────────
-    # subagent_loader returns dicts with model strings; convert to ChatOpenAI.
-    # tools — callable, loader вызовет её с schema_tables каждого subagent'а.
+    # ── Subagents (declarative из SUBAGENT.md) ───────────────────────────
+    # subagent_loader сканирует clients/<id>/subagents/*/SUBAGENT.md,
+    # парсит frontmatter (name, description, model, schema_tables,
+    # response_format, extra_skills_paths), рендерит {schema_section} и
+    # {data_map_compact} placeholders, резолвит response_format в Pydantic
+    # класс. tools — callable, loader вызовет её с (расширенным из ["*"])
+    # списком schema_tables каждого subagent'а.
     subagent_specs = load_subagents(
         client_dir=client_dir,
         default_model=llm,

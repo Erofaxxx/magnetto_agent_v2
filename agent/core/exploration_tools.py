@@ -102,7 +102,7 @@ def make_sample_table_tool(allowed_tables: Iterable[str]):
 
         - Уже знаешь ответ из data_map.md или предыдущего turn'а.
         - Нужны агрегаты/группировки/большой SELECT — это работа подагента,
-          делегируй task() или delegate_to_generalist(). sample_table — это
+          делегируй через task(). sample_table — это
           ТОЛЬКО подсмотр 5 строк, не анализ.
 
         ## Что возвращает
@@ -164,3 +164,43 @@ def make_sample_table_tool(allowed_tables: Iterable[str]):
             return f"⚠ sample_table failed: {exc}"
 
     return sample_table
+
+
+def make_describe_table_tool(allowed_tables: Iterable[str]):
+    """
+    Factory: возвращает @tool `describe_table` с baked-in allowed_tables.
+
+    Дешёвый discovery-tool: возвращает полную схему ОДНОЙ таблицы (имена
+    колонок + типы) без обращения к ClickHouse — всё из in-process SchemaCache.
+    Используется подагентом ДО написания SQL чтобы не гадать имена колонок.
+
+    Аналог `Read` в Claude Code: дешевле чем list_tables (который тащит ВСЕ
+    схемы), точнее чем sample_table (который ещё и SELECT делает).
+    """
+    allowed = set(allowed_tables)
+
+    @tool
+    def describe_table(table_name: str) -> str:
+        """
+        Полная схема таблицы ClickHouse: список колонок с типами в порядке
+        position. Используй ДО написания SQL когда нужно увидеть точные
+        имена и типы колонок (особенно для JOIN — типы должны совпадать).
+
+        Дешёвый tool: данные из in-process SchemaCache, без обращения к CH.
+        НЕ показывает данные (для этого sample_table). НЕ делает SELECT.
+
+        Args:
+            table_name: точное имя таблицы (без префикса 'magnetto.').
+
+        Returns:
+            Markdown с таблицей `# | name | type` или ⛔ если таблица не в scope.
+        """
+        if table_name not in allowed:
+            return (
+                f"⛔ describe_table: таблица '{table_name}' недоступна в этом scope. "
+                f"Доступны: {sorted(allowed) if allowed else '(пусто)'}."
+            )
+        cache = get_schema_cache()
+        return cache.render_table_reference(table_name)
+
+    return describe_table
