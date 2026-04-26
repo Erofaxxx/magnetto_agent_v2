@@ -114,12 +114,71 @@ def analyze_deepagents(
 # ─── Extractors ─────────────────────────────────────────────────────────────
 
 def _extract_final_text(messages: list) -> str:
+    """
+    Финальный текст для пользователя собирается ПРОГРАММНО (не из main'овского
+    AIMessage напрямую):
+
+      1. Все task ToolMessage в текущем turn'е (in order) → парсим их как
+         SubagentResult JSON (если subagent имеет response_format) или берём
+         весь content (если без response_format) → это «summary» части.
+      2. Текст последнего AIMessage от main → это «комментарий поверх».
+      3. Финал = "\\n\\n---\\n\\n".join(summaries + [main_text]).
+
+    Работает в паре с FinalAnswerCapMiddleware: middleware режет main
+    output до N×800 токенов, чтобы main физически не мог выкатить
+    переписку summary, а только короткий комментарий. Программная
+    композиция гарантирует что summary подагента ВСЕГДА доходит до
+    пользователя без потерь — независимо от того что main решил
+    сгенерить.
+
+    Когда нет ни одного task в turn'е (main отвечал сам через sample_table /
+    describe_table или вообще без tools) — возвращаем main'овский текст
+    как раньше. То есть для запросов БЕЗ делегирования поведение не меняется.
+    """
+    last_human_idx = _find_last_human_idx(messages)
+    turn_msgs = messages[last_human_idx:]
+
+    sub_summaries: list[str] = []
+    for msg in turn_msgs:
+        if isinstance(msg, ToolMessage) and (getattr(msg, "name", "") or "") == "task":
+            s = _extract_summary_from_subagent_result(msg.content)
+            if s:
+                sub_summaries.append(s)
+
+    main_text = _extract_main_ai_text(messages)
+
+    if not sub_summaries:
+        # Нет делегирований — main'овский текст и есть финал.
+        return main_text
+
+    # Композиция: summaries в порядке появления + main commentary в конце.
+    # Если main_text пустой (main только сделал tool calls) — отдаём только
+    # summaries. Если main_text есть — добавляем как «комментарий поверх».
+    parts = list(sub_summaries)
+    if main_text:
+        parts.append(main_text)
+    return "\n\n---\n\n".join(parts)
+
+
+def _find_last_human_idx(messages: list) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            return i
+    return 0
+
+
+def _extract_main_ai_text(messages: list) -> str:
+    """
+    Текст последнего AIMessage в истории. Аналог старого _extract_final_text.
+    Используется для извлечения main'овского комментария (после делегирования)
+    или прямого ответа main'а (когда без делегирования).
+    """
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):
             continue
         content = msg.content
         if isinstance(content, str) and content.strip():
-            return content
+            return content.strip()
         if isinstance(content, list):
             parts = [
                 b["text"] for b in content
@@ -129,6 +188,56 @@ def _extract_final_text(messages: list) -> str:
             if txt:
                 return txt
     return ""
+
+
+def _extract_summary_from_subagent_result(content) -> str:
+    """
+    Извлекаем summary из task ToolMessage:
+      - Если subagent с response_format=SubagentResult — content это JSON,
+        берём поле "summary".
+      - Если subagent без response_format — content это уже markdown,
+        отдаём как есть.
+      - Если структура неожиданная — возвращаем пустую строку (не ломаем
+        композицию остальных).
+    """
+    if not content:
+        return ""
+    # ToolMessage.content может быть str или list[dict]
+    text: str
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        # Соберём text-блоки
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                parts.append(b["text"])
+            elif isinstance(b, str):
+                parts.append(b)
+        text = "\n".join(parts)
+    else:
+        return ""
+
+    if not text.strip():
+        return ""
+
+    # Пробуем распарсить как JSON (response_format=SubagentResult случай)
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+            if isinstance(data, dict):
+                summary = data.get("summary")
+                if isinstance(summary, str) and summary.strip():
+                    return summary.strip()
+                # Если summary нет — возможно subagent вернул что-то нестандартное.
+                # Не дропаем, отдаём весь JSON-текст.
+                return stripped
+        except json.JSONDecodeError:
+            pass
+
+    # Не JSON — это free-form markdown от subagent без response_format.
+    return stripped
 
 
 def _extract_plots(messages: list) -> list[str]:

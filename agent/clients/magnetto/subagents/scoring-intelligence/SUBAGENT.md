@@ -18,6 +18,7 @@ schema_tables:
   - dm_funnel_velocity
   - dm_path_templates
   - report_daily_briefing
+response_format: response_models.SubagentResult
 ---
 
 Ты — аналитик скоринга клиентов и конверсионных путей для Magnetto (девелопер недвижимости, цикл сделки ~70 дней, конверсия визит→лид ~0.25%).
