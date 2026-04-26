@@ -111,6 +111,8 @@ class JobStatusResponse(BaseModel):
     success: Optional[bool] = None
     text_output: Optional[str] = None
     plots: Optional[list[str]] = None
+    plot_urls: Optional[list[str]] = None
+    parquet_paths: Optional[list[str]] = None
     tool_calls: Optional[list[dict]] = None
     error: Optional[str] = None
 # ─── Background worker ────────────────────────────────────────────────────────
@@ -242,6 +244,75 @@ async def get_session_file(session_id: str, path: str):
     if not full.exists() or not full.is_file():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
     return FileResponse(str(full))
+
+
+@app.get("/api/session/{session_id}/parquet", summary="Read a session parquet as paginated JSON")
+async def get_session_parquet(
+    session_id: str,
+    path: str,
+    offset: int = 0,
+    limit: int = 100,
+):
+    """
+    Read a parquet file from the session's virtual filesystem and return
+    a paginated JSON view. Designed for the chat UI: fetches a slice of
+    rows + column dtypes + total row count, all in one shot.
+
+    Path must start with /parquet/ (other dirs are not supported here).
+    `limit` is capped at 1000 to avoid pulling the whole table over HTTP.
+
+    Example:
+      GET /api/session/abc/parquet?path=/parquet/x.parquet&offset=0&limit=100
+    """
+    if not _USE_DEEPAGENTS:
+        raise HTTPException(status_code=400, detail="Parquet endpoint only available with USE_DEEPAGENTS=1")
+    if not path.startswith("/parquet/"):
+        raise HTTPException(status_code=400, detail="Path must start with /parquet/")
+    import re as _re
+    if ".." in path or _re.search(r"[/\\]\.[/\\]", path):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+    if offset < 0:
+        offset = 0
+
+    from config import TEMP_DIR
+    import pathlib
+    rel = path.lstrip("/")
+    full = pathlib.Path(TEMP_DIR) / "sessions" / session_id / rel
+    if not full.exists() or not full.is_file():
+        raise HTTPException(status_code=404, detail=f"Parquet not found: {path}")
+
+    try:
+        import pandas as _pd
+        df = _pd.read_parquet(str(full))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read parquet: {exc}")
+
+    total_rows = int(len(df))
+    total_cols = int(len(df.columns))
+    columns = [
+        {"name": str(c), "dtype": str(df[c].dtype)}
+        for c in df.columns
+    ]
+
+    # Slice + JSON-safe coercion (NaN→None, datetimes→isoformat, numpy→native)
+    sliced = df.iloc[offset : offset + limit]
+    rows = json.loads(sliced.to_json(orient="records", date_format="iso", default_handler=str))
+
+    return {
+        "path": path,
+        "session_id": session_id,
+        "total_rows": total_rows,
+        "total_cols": total_cols,
+        "offset": offset,
+        "limit": limit,
+        "returned_rows": len(rows),
+        "columns": columns,
+        "rows": rows,
+    }
 
 
 @app.get("/api/session/{session_id}/files", summary="List files in session directory")
