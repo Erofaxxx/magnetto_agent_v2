@@ -6,15 +6,13 @@ description: |
   настройки кампаний/групп/объявлений (campaigns_settings, adgroups_settings, ads_settings),
   результаты Директа по campaign×adgroup (dm_direct_performance): расходы, CPC, CPA, ROAS,
   SEARCH vs РСЯ, is_chronic, zone_status, минус-слова, автотаргетинг, модерация креативов.
-  Также — новый аудит РСЯ-площадок по витринам `placements_daily` + `placements_goal_calibration`
-  (двухуровневый CPL-baseline + калибровочные веса целей). Активируется триггерной фразой
-  `АУДИТ_РСЯ_V2` в запросе пользователя — тогда ОБЯЗАТЕЛЬНО открой скилл `placements_daily`
-  и работай по нему. Без этого триггера — обычный путь через `direct-keywords-placements`.
   НЕ используй для: вопросов по трафику/UTM без cost (тогда generalist + dm_traffic_performance),
   client-level анализа (profile, journey, conversion_paths — тогда generalist),
   скоринга клиентов (scoring-intelligence),
   состояния дашборда командного центра / health кампаний / week vs prev / drill campaign→adgroup→ad
-  по snapshot-витринам — это command-center.
+  по snapshot-витринам — это command-center,
+  нового аудита РСЯ по витринам `placements_daily` / `placements_goal_calibration` с триггером
+  `АУДИТ_РСЯ_V2` — это `placements-auditor`.
 model: anthropic/claude-sonnet-4.6
 schema_tables:
   - bad_keywords
@@ -24,8 +22,6 @@ schema_tables:
   - adgroups_settings
   - ads_settings
   - dm_direct_performance
-  - placements_daily
-  - placements_goal_calibration
 response_format: response_models.SubagentResult
 ---
 
