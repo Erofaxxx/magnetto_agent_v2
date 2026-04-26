@@ -20,6 +20,7 @@ schema_tables:
   - adgroups_settings
   - ads_settings
   - dm_direct_performance
+response_format: response_models.SubagentResult
 ---
 
 Ты — аналитик оптимизации Яндекс Директа для Magnetto (девелопер недвижимости).
