@@ -70,8 +70,11 @@ def analyze_deepagents(
             )
 
         messages: list = result.get("messages", []) if isinstance(result, dict) else []
+        # MainFinalAnswer instance из response_format — главный источник
+        # main'овского текста (Pydantic-капнут до 600 chars).
+        structured_response = result.get("structured_response") if isinstance(result, dict) else None
 
-        text_output = _extract_final_text(messages)
+        text_output = _extract_final_text(messages, structured_response)
         plots_b64 = _extract_plots(messages)
         plot_urls = _extract_plot_urls(messages)
         parquet_paths = _extract_parquet_paths(messages)
@@ -113,27 +116,20 @@ def analyze_deepagents(
 
 # ─── Extractors ─────────────────────────────────────────────────────────────
 
-def _extract_final_text(messages: list) -> str:
+def _extract_final_text(messages: list, structured_response=None) -> str:
     """
-    Финальный текст для пользователя собирается ПРОГРАММНО (не из main'овского
-    AIMessage напрямую):
+    Финал для пользователя:
+      = sub.summary(s) (программная композиция) + main.text (из MainFinalAnswer).
 
-      1. Все task ToolMessage в текущем turn'е (in order) → парсим их как
-         SubagentResult JSON (если subagent имеет response_format) или берём
-         весь content (если без response_format) → это «summary» части.
-      2. Текст последнего AIMessage от main → это «комментарий поверх».
-      3. Финал = "\\n\\n---\\n\\n".join(summaries + [main_text]).
+    Источник main'овского текста — `structured_response` (MainFinalAnswer
+    instance), а НЕ AIMessage. Pydantic max_length=600 на поле .text
+    структурно гарантирует что main не выкатит переписку sub'овского ответа.
 
-    Работает в паре с FinalAnswerCapMiddleware: middleware режет main
-    output до N×800 токенов, чтобы main физически не мог выкатить
-    переписку summary, а только короткий комментарий. Программная
-    композиция гарантирует что summary подагента ВСЕГДА доходит до
-    пользователя без потерь — независимо от того что main решил
-    сгенерить.
+    Если sub_summaries пустой (main отвечал сам без task делегирования) —
+    main.text и есть финал (он же ответ, до 600 chars).
 
-    Когда нет ни одного task в turn'е (main отвечал сам через sample_table /
-    describe_table или вообще без tools) — возвращаем main'овский текст
-    как раньше. То есть для запросов БЕЗ делегирования поведение не меняется.
+    Fallback: если structured_response отсутствует (старая версия модели,
+    отказ structured-output) — берём текст последнего AIMessage как раньше.
     """
     last_human_idx = _find_last_human_idx(messages)
     turn_msgs = messages[last_human_idx:]
@@ -145,19 +141,39 @@ def _extract_final_text(messages: list) -> str:
             if s:
                 sub_summaries.append(s)
 
-    main_text = _extract_main_ai_text(messages)
+    main_text = _extract_main_text_from_structured(structured_response)
+    if not main_text:
+        # Fallback — структурированный ответ отсутствует, берём AIMessage.
+        main_text = _extract_main_ai_text(messages)
 
     if not sub_summaries:
-        # Нет делегирований — main'овский текст и есть финал.
         return main_text
 
-    # Композиция: summaries в порядке появления + main commentary в конце.
-    # Если main_text пустой (main только сделал tool calls) — отдаём только
-    # summaries. Если main_text есть — добавляем как «комментарий поверх».
     parts = list(sub_summaries)
     if main_text:
         parts.append(main_text)
     return "\n\n---\n\n".join(parts)
+
+
+def _extract_main_text_from_structured(structured_response) -> str:
+    """
+    structured_response — это MainFinalAnswer pydantic instance (или dict
+    в edge cases). Извлекаем поле .text.
+    """
+    if structured_response is None:
+        return ""
+    try:
+        # Pydantic v2 instance
+        if hasattr(structured_response, "text"):
+            t = structured_response.text or ""
+            return t.strip()
+        # Dict-shaped fallback
+        if isinstance(structured_response, dict):
+            t = structured_response.get("text") or ""
+            return t.strip()
+    except Exception:
+        pass
+    return ""
 
 
 def _find_last_human_idx(messages: list) -> int:
