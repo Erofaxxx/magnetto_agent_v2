@@ -32,7 +32,7 @@ from .budget_middleware import BudgetMiddleware
 from .dynamic_context_middleware import DynamicContextMiddleware
 from .enforcement_middleware import HardcodeDetector
 from .exploration_tools import make_describe_table_tool, make_sample_table_tool
-from .final_answer_cap_middleware import FinalAnswerCapMiddleware
+from .main_response_models import MainFinalAnswer
 from .schema_cache import get_schema_cache
 from .session_backend import make_backend_factory
 from .subagent_loader import load_subagents
@@ -214,6 +214,11 @@ def build_agent(
     agent = create_deep_agent(
         model=llm,
         tools=main_tools,
+        # response_format=MainFinalAnswer — структурно ограничивает финальный
+        # текст main'а до 600 chars (Pydantic max_length). Main физически
+        # не может выкатить переписку sub'овского ответа. api_adapter
+        # извлекает structured_response.text и склеивает с sub.summary.
+        response_format=MainFinalAnswer,
         memory=[
             str(client_dir / "AGENTS.md"),
             str(client_dir / "data_map.md"),
@@ -242,14 +247,6 @@ def build_agent(
             DynamicContextMiddleware(),
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_ITERATIONS),
-            # FinalAnswerCapMiddleware — режет max_tokens main'а до
-            # N×800 (где N — число делегирований в текущем turn'е) когда
-            # main собирается отвечать после task. Работает в паре с
-            # программной композицией в api_adapter._extract_final_text:
-            # финальный ответ = sub.summary + main_text. Cap гарантирует
-            # что main не выкатит ещё одну переписку summary поверх. Disable:
-            # FINAL_ANSWER_CAP=0 в env.
-            FinalAnswerCapMiddleware(),
             HardcodeDetector(),      # blocks pd.DataFrame({...: [lits]}) patterns
             # Убираем у main ненужные tools от встроенной FilesystemMiddleware.
             # glob/grep/ls провоцировали fallback-поведение (main искал

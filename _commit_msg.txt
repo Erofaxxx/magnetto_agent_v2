@@ -1,0 +1,97 @@
+feat(main): response_format=MainFinalAnswer with Pydantic max_length=600 to structurally prevent rewrites
+
+Решает проблему обнаруженную в session 5e5b6921 (PR #20 deploy):
+main проигнорировал AGENTS.md инструкцию «не пересказывай sub.summary»,
+переписал sub'овский ответ своими словами, упёрся в max_tokens cap=800
+и обрезался посреди таблицы → пользователь увидел дубль + обрыв.
+
+Прямой вывод: prompt-only недостаточно надёжен. Нужно структурное
+ограничение которое модель физически не может обойти.
+
+ARCHITECTURE
+────────────
+Используем тот же механизм что у subagents — `response_format=Pydantic`.
+LangChain автоматически добавляет structured-output tool main'у. Main
+ОБЯЗАН закончить turn вызовом этого tool с аргументами совпадающими по
+Pydantic-схеме. Pydantic `max_length=600` на единственном поле `text`
+ФИЗИЧЕСКИ режет main'овский финальный текст до 600 chars (~150 токенов).
+
+Sub'овский ответ обычно 3000+ chars — main не может в 600 chars
+повторить даже сокращённую версию. Структурно невозможно.
+
+WHAT CHANGED
+────────────
+- NEW agent/core/main_response_models.py — `MainFinalAnswer` Pydantic
+  с одним полем `text: str = Field(default="", max_length=600, ...)`.
+  Description объясняет два кейса использования (после делегирования —
+  короткий комментарий; без делегирования — прямой ответ ≤600 chars).
+
+- agent_factory: `create_deep_agent(..., response_format=MainFinalAnswer, ...)`.
+  Передаёт structured-output для main, аналогично subagent'ам.
+
+- agent_factory: УДАЛЁН `FinalAnswerCapMiddleware` (был добавлен в PR #20).
+  Pydantic max_length=600 теперь главный механизм, middleware избыточен.
+  Удалён файл `final_answer_cap_middleware.py`.
+
+- api_adapter._extract_final_text: теперь принимает второй аргумент
+  `structured_response` (MainFinalAnswer instance из result). Извлекает
+  `.text` и склеивает с sub.summaries как раньше.
+  Fallback: если structured_response отсутствует (sanity check) —
+  берёт текст последнего AIMessage, как старая логика.
+
+- AGENTS.md: секция «9. Ответ» переписана:
+  - Объясняет что ответ ОБЯЗАТЕЛЬНО через MainFinalAnswer tool
+  - Пишет что text имеет жёсткий лимит 600 chars
+  - Гайдлайны для двух кейсов (после task / без task)
+  - «Если нечего добавить — text="" (пустая строка)»
+
+CACHE IMPACT
+────────────
+- response_format на main → добавляет structured-output tool в main's
+  tools list → один cold start main'а на первом запросе после рестарта.
+  Тот же тип cold start как у subagent'ов в PR #20.
+- В пределах сессии после первого хита — кэш стабилен.
+
+EXPECTED BEHAVIOR CHANGE
+────────────────────────
+- Main больше НЕ может выкатить переписку sub.summary. Pydantic режет.
+- Если main «попытается» — структурированный output validation отрежет
+  text до 600 chars или langchain попросит main переделать.
+- Финальный ответ пользователю гарантированно: sub.summary + ≤600 chars
+  main commentary. Без дублей. Без обрывов посреди таблицы.
+
+EXPECTED COST CHANGE
+────────────────────
+- Main output: было 800 токенов (до cap'а), станет ≤150 токенов
+  (~600 chars / 4). $0.012 → $0.002 на main output.
+- Cold start один раз после деплоя.
+
+ROLLBACK
+────────
+- `git revert <this commit>` — чисто, один коммит.
+- Если хочется откатить только response_format без удаления модели —
+  отдельным коммитом убрать `response_format=MainFinalAnswer` из
+  create_deep_agent. Но проще `git revert` всё.
+
+POTENTIAL ISSUES TO WATCH
+─────────────────────────
+- 600 chars может оказаться тесно для случаев когда main отвечает САМ
+  (sample_table → ответ). Если пользователь жалуется — поднять до 1000
+  или сделать второе поле `direct_answer: str (max_length=2000)`.
+- Multi-subagent синтез: main может захотеть написать сравнение двух
+  результатов — 600 chars впритык. Если жмёт — расширить max_length
+  или добавить отдельное поле synthesis.
+- LangChain должен корректно обработать Pydantic max_length validation.
+  Если модель превышает — обычно langchain retry с уточнением. Если
+  нет — может быть ошибка structured output, нужно мониторить.
+
+TEST PLAN
+─────────
+- [ ] systemctl restart, проверить чистый старт
+- [ ] Запрос с делегированием: main.text должен быть ≤600 chars,
+      финальный ответ = полный sub.summary + короткий main commentary.
+      НЕТ дубля. НЕТ обрыва.
+- [ ] Запрос без делегирования (sample_table): main.text это весь
+      ответ, ≤600 chars.
+- [ ] Multi-subagent: проверить синтез — может потребовать ослабить cap.
+- [ ] Если main не может уложиться — мониторить ошибки в журнале.
