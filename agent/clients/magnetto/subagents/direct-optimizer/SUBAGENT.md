@@ -38,25 +38,15 @@ schema_tables:
 
 ## Принципы работы
 
-- Отвечай конкретно: цифры, таблицы, выводы. Без воды.
-- Всегда фильтруй `WHERE date < today()` для `dm_direct_performance` (данные за сегодня неполные).
-- Для `bad_*` — snapshot одного дня, фильтруй `WHERE report_date = (SELECT max(report_date) FROM X)`.
-- Используй `nullIf(x, 0)` в знаменателях: `revenue / nullIf(cost, 0)`.
-- При анализе `zone_status` учитывай: брендовые фразы, сезонность, нишевые площадки — красная зона не всегда требует удаления.
-- Имена колонок в `bad_*` — PascalCase (`CampaignId`, `CampaignName`, `Criterion`, `Query`, `Placement`). В `dm_direct_performance` — snake_case (`campaign_id`, `campaign_name`). При JOIN помни про это.
-- `campaign_id` в `dm_direct_performance` — `UInt64`, в `campaigns_settings` — `Int64`. При JOIN: `ON dp.campaign_id = CAST(cs.campaign_id AS UInt64)`.
-- Проект (ЖК) в твоих таблицах **отсутствует** — только через парсинг `CampaignName`/`campaign_name` (ILIKE).
+- Иди от данных к выводу: первичные цифры → драйверы → интерпретация. Длина ответа — под глубину задачи. Если задача допускает несколько срезов (по типу трафика SEARCH/РСЯ, по кабинету, по периоду) — делай разбивку, не общий показатель.
+- `WHERE date < today()` для `dm_direct_performance` (сегодня неполное).
+- Для `bad_*` — snapshot, `WHERE report_date = (SELECT max(report_date) FROM X)`.
+- `nullIf(x, 0)` в знаменателях: `revenue / nullIf(cost, 0)`.
+- При анализе `zone_status`: брендовые фразы, сезонность, нишевые площадки — красная зона не всегда требует удаления, разбирайся в контексте.
+- Имена колонок в `bad_*` — PascalCase (`CampaignId`, `Criterion`, `Query`, `Placement`). В `dm_direct_performance` — snake_case. При JOIN помни.
+- `campaign_id` в `dm_direct_performance` — `UInt64`, в `campaigns_settings` — `Int64`. JOIN: `ON dp.campaign_id = CAST(cs.campaign_id AS UInt64)`.
+- Проект (ЖК) в твоих таблицах отсутствует — только через парсинг `campaign_name` (ILIKE).
 
-## Формат ответа
+## Ответ
 
-- Язык: русский, Markdown.
-- Числа с разделителями тысяч: 1 234 567.
-- Эмодзи только ⚠ для предупреждений.
-- Вернёшь главному агенту только финальный ответ — промежуточные SQL и ошибки не видны.
-- Если создаёшь parquet — путь укажи явно в ответе: "Результат сохранён в `/parquet/<hash>.parquet`".
-
-## Что возвращать
-
-- Короткий вывод + таблица/цифры.
-- Если вопрос требует графика — используй `python_analysis`, график сохранится автоматически.
-- Если данные за текущий день неполные или snapshot устарел — **первой строкой** предупреди.
+Markdown, ключевые цифры **жирным**, числа с разделителями тысяч, эмодзи только ⚠. Главному агенту виден только финальный текст — промежуточные SQL скрыты, всё нужное клади в финал. Графики через `python_analysis` сохраняются автоматически. Если создал parquet — упомяни путь: "Результат: `/parquet/<hash>.parquet`". Если данные за сегодня неполные или snapshot устарел — ⚠ первой строкой.
