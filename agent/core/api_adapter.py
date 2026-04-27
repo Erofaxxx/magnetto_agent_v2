@@ -298,8 +298,31 @@ def _extract_plot_urls(messages: list) -> list[str]:
     return urls
 
 
+def _normalize_parquet_path(p: str) -> str:
+    """
+    Convert any path we get back from tools into the virtual `/parquet/<file>`
+    namespace the frontend understands.
+
+    `clickhouse_query` returns absolute physical paths like
+        /root/.../sessions/<sid>/parquet/query_abc.parquet
+    But the public API endpoint `/api/session/{sid}/parquet?path=...` rejects
+    anything not starting with `/parquet/` (path-traversal guard). Without
+    normalization, the frontend gets a chip it can't open (400).
+
+    Strategy: take everything after the last `/parquet/` segment and prepend
+    `/parquet/`. Already-virtual paths pass through unchanged.
+    """
+    if not p:
+        return p
+    if p.startswith("/parquet/"):
+        return p
+    if "/parquet/" in p:
+        return "/parquet/" + p.rsplit("/parquet/", 1)[1]
+    return p  # leave anything else alone — endpoint will reject if invalid
+
+
 def _extract_parquet_paths(messages: list) -> list[str]:
-    """Physical parquet paths from CURRENT turn."""
+    """Physical parquet paths from CURRENT turn, normalized to virtual."""
     last_human_idx = -1
     for i, msg in enumerate(messages):
         if isinstance(msg, HumanMessage):
@@ -307,17 +330,37 @@ def _extract_parquet_paths(messages: list) -> list[str]:
     if last_human_idx < 0:
         return []
     paths: list[str] = []
+    seen: set[str] = set()
+
+    def _add(p: str) -> None:
+        norm = _normalize_parquet_path(p)
+        if norm and norm not in seen:
+            seen.add(norm)
+            paths.append(norm)
+
     for msg in messages[last_human_idx:]:
         if not isinstance(msg, ToolMessage):
             continue
-        if (getattr(msg, "name", "") or "") != "clickhouse_query":
-            continue
+        name = (getattr(msg, "name", "") or "")
         try:
             data = json.loads(msg.content)
-            if data.get("parquet_path"):
-                paths.append(data["parquet_path"])
         except Exception:
-            pass
+            data = None
+
+        # 1) clickhouse_query auto-saves a parquet and returns its path.
+        if name == "clickhouse_query" and isinstance(data, dict):
+            if data.get("parquet_path"):
+                _add(data["parquet_path"])
+
+        # 2) SubagentResult tool call — the structured response from a
+        #    subagent. The model puts its parquet_paths there. Some of them
+        #    may be virtual already, some absolute, some completely made up
+        #    (model hallucinated a filename). Normalize what we can.
+        if name == "SubagentResult" and isinstance(data, dict):
+            for p in (data.get("parquet_paths") or []):
+                if isinstance(p, str):
+                    _add(p)
+
     return paths
 
 
