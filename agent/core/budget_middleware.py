@@ -31,7 +31,7 @@ import threading
 from typing import Any
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, ToolMessage
 
 
 _DEFAULT_BUDGET = int(os.environ.get("MAX_AGENT_ITERATIONS", "30"))
@@ -52,53 +52,63 @@ def _count_tool_calls(state: dict) -> int:
 
 
 def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None:
-    """Inject a short budget notice as a transient SystemMessage at the END of
-    the conversation (suffix), NOT as an append to the global system_message.
+    """Inject a budget notice as a fresh HumanMessage at the END of the
+    conversation. The text is **static within a level** so the cached prefix
+    is preserved across iterations.
 
-    Why: appending to system_message changes the cached prefix on every call
-    (the «N/M итераций» counter increments each turn). Anthropic auto-cache
-    treats this as a fresh prefix → cache miss EVERY iteration once the
-    threshold kicks in (was burning ~$0.30/iter from iter 10 onwards on long
-    sub runs).
+    Why HumanMessage and not SystemMessage:
+        ChatOpenAI (our transport) sends OpenAI-format messages to OpenRouter,
+        which translates to Anthropic format. ALL `SystemMessage` instances in
+        the messages array — anywhere in the conversation — get **merged into
+        Anthropic's single `system` field** at translation time. The system
+        field is part of the cached prefix; any modification to it invalidates
+        the entire cache.
 
-    Adding a fresh SystemMessage at the very end keeps messages 0..N-1 byte-
-    identical to the previous turn → those still hit cache. Only the new tail
-    is uncached, which is correct.
+        That's why our previous attempt to append a SystemMessage at the tail
+        still broke the cache: even though we put it in the messages list,
+        OpenRouter folded it back into system, and the system text changed
+        each turn (different notice).
+
+        HumanMessage stays as `role="user"` in both OpenAI and Anthropic
+        formats — it's just another conversation message. Adding one at the
+        tail behaves identically to a normal tool/assistant turn ending: the
+        prefix [system, m0..m_{n-1}] is unchanged → cache hit on the bulk.
+
+    Why static text per level:
+        Even with HumanMessage, if the text varies between iterations within
+        a level (e.g. "осталось 2" → "осталось 1"), the cached prefix from
+        the previous iter doesn't match the new one (notice text differs).
+        Static text per level → prefix matches → cache hit at iter N+1.
+        Worst case: 1 miss per level transition (no-notice → ⚡ → ⚠ → 🚨 → ⛔).
     """
     remaining = budget - used
-    # Only fire on hard-limit thresholds. The previous soft hints (⚡ at
-    # remaining≤10 and ⚠ at remaining≤5) were appended to the message stream
-    # every iteration, with a different counter each time. Auto-cache (Anthropic
-    # via OpenRouter `cache_control: ephemeral`) places its breakpoint on the
-    # last message — so the changing counter text in the trailing position
-    # invalidated the cached prefix on EVERY iteration past iter 10. Net effect
-    # on a 20-iter sub: ~10 cache misses × ~$0.20 = ~$2 wasted per session.
-    #
-    # Now the notice fires only when the model needs to actually adjust its
-    # behavior (slow down at 🚨, stop tools at ⛔). That's at most 2 cache
-    # breakpoint shifts per session — and in the typical case where the sub
-    # finishes in <18 iters, zero shifts.
-    if remaining > 2:
-        return
+    if remaining > 10:
+        return  # silent, no cache impact
     if remaining <= 0:
         note = (
-            f"[⛔ ЛИМИТ ИСЧЕРПАН ({used}/{budget}). "
-            "Немедленно дай финальный ответ на основе уже собранных данных. "
-            "НЕ вызывай инструменты.]"
+            "[SYSTEM REMINDER: лимит итераций ИСЧЕРПАН. Дай финальный ответ "
+            "на основе уже собранных данных. НЕ вызывай инструменты.]"
         )
-    else:  # remaining 1..2
+    elif remaining <= 2:
         note = (
-            f"[🚨 Почти исчерпан ({used}/{budget}). Осталось {remaining} вызовов. "
-            "Используй только если критически необходимо. После — финальный ответ.]"
+            "[SYSTEM REMINDER: 🚨 почти исчерпан лимит итераций. Используй tool "
+            "только если критически необходимо. После — финальный ответ.]"
+        )
+    elif remaining <= 5:
+        note = (
+            "[SYSTEM REMINDER: ⚠ мало итераций осталось. Объединяй оставшиеся "
+            "запросы через WITH/CTE, не дроби на шаги.]"
+        )
+    else:  # remaining 6..10
+        note = (
+            "[SYSTEM REMINDER: ⚡ лимит итераций приближается. Избегай дробных "
+            "шагов, готовься переходить к финалу.]"
         )
 
-    # Append a fresh SystemMessage to request.messages (suffix). This message is
-    # NOT cached on subsequent turns (it's regenerated each call with new
-    # numbers), but the prefix before it stays stable → cache hit on the
-    # heavy part.
     if request.messages is None:
         request.messages = []
-    request.messages = list(request.messages) + [SystemMessage(content=note)]
+    request.messages = list(request.messages) + [HumanMessage(content=note)]
+    print(f"[BudgetMiddleware] used={used}/{budget} remaining={remaining} → notice appended")
 
 
 class BudgetMiddleware(AgentMiddleware):
