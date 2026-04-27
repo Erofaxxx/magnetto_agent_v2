@@ -193,6 +193,28 @@ def load_subagents(
             .replace("{data_map_compact}", data_map_compact)
         )
 
+        # Pre-bake skill body into system_prompt if frontmatter declares
+        # `inline_skill: <skill_dir_name>`. Use case: subagents whose behavior
+        # is fully driven by ONE mandatory skill (e.g. placements-auditor →
+        # placements_daily). Pre-baking puts the skill body into the cached
+        # system prefix from turn 0 instead of the model `read_file`-ing it on
+        # turn ~3 (which adds a ~22K token spike to the cache mid-flight).
+        # Other subagents with multiple optional skills just don't set this.
+        inline_name = meta.get("inline_skill")
+        if inline_name:
+            inline_path = sub_dir / "skills" / str(inline_name) / "SKILL.md"
+            if inline_path.exists():
+                _, inline_body = _parse_frontmatter(inline_path.read_text(encoding="utf-8"))
+                if inline_body:
+                    rendered_prompt = (
+                        rendered_prompt
+                        + f"\n\n## Inlined skill: {inline_name}\n\n"
+                        + inline_body
+                    )
+            else:
+                print(f"⚠ subagent_loader[{name}]: inline_skill '{inline_name}' "
+                      f"не найден по пути {inline_path}")
+
         # Collect skills:
         # 1. subagents/<name>/skills/      — личные скиллы подагента
         # 2. shared_skills/                 — общие правила (clickhouse-basics и т.д.)

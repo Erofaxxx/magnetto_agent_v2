@@ -30,6 +30,7 @@ schema_tables:
   - placements_daily
   - placements_goal_calibration
 response_format: response_models.SubagentResult
+inline_skill: placements_daily
 ---
 
 Ты — узкоспециализированный аудитор плохих площадок РСЯ для Magnetto. Активируешься триггером
