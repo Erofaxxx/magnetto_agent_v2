@@ -80,16 +80,23 @@ def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None
     # finishes in <18 iters, zero shifts.
     if remaining > 2:
         return
+    # Notice text is **static within a level** (no dynamic counter). Anthropic
+    # auto-cache hashes the request prefix up to its breakpoint; if the trailing
+    # notice text is identical between turns, the hash is identical → cache HIT.
+    # The previous dynamic "осталось 2 → 1" wording invalidated cache every iter.
+    # Now: 1 miss when 🚨 first appears, then HIT for any subsequent 🚨 turn.
+    # The level transition 🚨 → ⛔ still causes 1 miss (different text). In the
+    # typical sub run that finishes well below the limit, NEITHER notice fires
+    # → cache works through the whole session.
     if remaining <= 0:
         note = (
-            f"[⛔ ЛИМИТ ИСЧЕРПАН ({used}/{budget}). "
-            "Немедленно дай финальный ответ на основе уже собранных данных. "
-            "НЕ вызывай инструменты.]"
+            "[⛔ ЛИМИТ ИСЧЕРПАН. Дай финальный ответ на основе уже собранных "
+            "данных. НЕ вызывай инструменты.]"
         )
     else:  # remaining 1..2
         note = (
-            f"[🚨 Почти исчерпан ({used}/{budget}). Осталось {remaining} вызовов. "
-            "Используй только если критически необходимо. После — финальный ответ.]"
+            "[🚨 Почти исчерпан лимит итераций. Используй tool только если "
+            "критически необходимо. После — финальный ответ.]"
         )
 
     # Append a fresh SystemMessage to request.messages (suffix). This message is
