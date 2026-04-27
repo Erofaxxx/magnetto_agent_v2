@@ -35,7 +35,8 @@ description: |
 
 **Контракт исполнения** (важно для скорости):
 - **Один большой `clickhouse_query`** с CTE-классификацией внутри (см. Раздел 4 — Шаблон 0). Не дроби на отдельные запросы для baseline, calibration, выборки.
-- **`python_analysis` — максимум один раз, и НЕ для печати таблиц.** Размеченный датасет уже в parquet от Шаблона 0. В `python_analysis` печатай в stdout только короткие counts/sums (1–5 строк, типа «excludes per campaign: 705590486=46, 701940874=18, …»). **Не делай `print(df.head(30))`, `print(df.to_string())`, `result = df.to_markdown()`** — это копирует таблицы в контекст. Не создавай новые parquet через `df.to_parquet` — главного хватит, фронтенд покажет его таблицей с пагинацией.
+- **`python_analysis` — обязательный шаг.** Используется чтобы собрать **curated parquet для UI** (см. Раздел 10): отфильтровать только `EXCL_*` строки, оставить компактный набор колонок, добавить колонку «Что не так» через эвристики (тип площадки + класс + конкретные цифры), сохранить в `/parquet/<имя>.parquet`. Стандартно достаточно одного–двух вызовов: один для curated parquet, опционально второй — для пост-агрегаций для шапки/сводки.
+- **В stdout `python_analysis` НЕ печатай таблицы.** Печатай только короткие counts/sums (1–5 строк, типа «excludes per campaign: 705590486=46, 701940874=18, …»). **Не делай `print(df.head(30))`, `print(df.to_string())`, `result = df.to_markdown()`** — это копирует таблицы в контекст и грузит токены. Большие списки — в parquet через `df.to_parquet('/parquet/<имя>.parquet')`, не в stdout.
 - `describe_table` / `sample_table` / `list_tables` — **не вызывай**, схема уже здесь.
 - В `think_tool` — 1–3 пункта, не больше. Не пиши черновик финального отчёта в assistant-сообщениях между tool-calls — это попадает в кэш-префикс на каждой следующей итерации и раздувает контекст. Финал пиши **один раз**, сразу в `summary` SubagentResult.
 
@@ -407,17 +408,111 @@ ORDER BY camp_id, multiIf(class_ LIKE 'EXCL_%', 1, class_ IN ('GOLD','KEEP_3PLUS
 
 ## 10. Возврат результата (Parquet + структурированный ответ)
 
-`clickhouse_query` автоматически сохраняет результат каждого SELECT'а в `/parquet/<hash>.parquet` сессии — путь возвращается в его JSON-ответе. Этот parquet — **главный носитель полной картины**. Markdown-summary её только агрегирует.
+`clickhouse_query` автоматически сохраняет сырой результат Шаблона 0 в `/parquet/query_<hash>.parquet`. Этот файл — **сырьё**, в нём 26 колонок и 4000+ площадок всех классов (KEEP/EXCL/MEDIA/NOT_ENOUGH_DATA). Маркетологу его показывать нельзя — он утонет. Твоя задача в `python_analysis` — пересобрать **curated parquet** для UI.
 
 Подагент возвращает `SubagentResult`:
 
-- `summary` — markdown строго по формату Раздела 7. API-лимит вывода 16K токенов; **целься в ~5K** (топ-5 на кампанию + сводка + опциональные общие наблюдения). Полный список — в parquet, не дублируй его в md.
-- `parquet_paths` — **путь, который вернул `clickhouse_query` после Шаблона 0** (поле `parquet_path` в его JSON-ответе). Этот parquet уже содержит всю разметку (колонка `class_`, все исходные поля, baseline, lead_eq) — фронтенд откроет его таблицей с пагинацией, маркетолог увидит ВСЕ исключения. **Не создавай новый parquet через `df.to_parquet` для финального ответа** — главного хватит, не плоди файлы. (Если вдруг по делу нужен дополнительный срез — `df.to_parquet('/parquet/<имя>.parquet')` теперь работает, путь автоматически мапится на session-папку. Но для типового аудита одного главного parquet'а достаточно.)
+- `summary` — markdown строго по формату Раздела 7. API-лимит вывода 16K токенов; **целься в ~5K** (топ-5 на кампанию + сводка + опциональные общие наблюдения). Полный список — в curated parquet, не дублируй в md.
+- `parquet_paths` — **путь curated parquet'а** из подраздела 10.1.
 - `used_tables: ["placements_daily", "placements_goal_calibration"]`.
 - `used_skills: ["placements_daily"]`.
 - `warnings` — ⚠ если CPL_baseline свалился на фолбэк 15000 (lead_cab=0), если важные цели имели `confidence='low'`, если последняя дата активности кабинета `< today - 2`, если сработало budget-уведомление `⛔` и отчёт частичный.
 
-В конец `summary` (после «Общих наблюдений») добавляй секцию **«Parquet-выходы»** — для каждого parquet'а строй мини-словарь колонок (имя × тип × 1 строка описания). Это стабильный контракт для UI-рендера: фронт открывает parquet таблицей с пагинацией; маркетолог фильтрует по `class_`, ищет по `Placement`, сортирует по `cost`.
+В конец `summary` (после «Общих наблюдений») добавляй секцию **«Parquet-выходы»** — мини-словарь колонок (имя × тип × 1 строка описания). Это стабильный контракт для UI-рендера: фронт открывает parquet таблицей с пагинацией; маркетолог сортирует по cost, фильтрует по кампании.
+
+### 10.1. Curated parquet — что положить и как собрать
+
+**Что должно быть в curated parquet:**
+
+Только строки `class_ LIKE 'EXCL_%'` (исключения, ради которых аудит и делается). KEEP/GOLD/MEDIA/NOT_ENOUGH_DATA — НЕ кладёшь, маркетологу они не нужны для action'а.
+
+**Колонки** (компактный набор, не 26):
+
+| Колонка parquet | Источник | Зачем |
+|---|---|---|
+| `Кампания` | `camp_name` | Имя кампании (для фильтрации в UI) |
+| `ID кампании` | `camp_id` | UInt64 |
+| `Площадка` | `Placement` | Имя домена/пакета |
+| `Расход, ₽` | `cost` | Float64 |
+| `Клики` | `clicks` | UInt64 |
+| `Цена клика, ₽` | `cost / nullIf(clicks,0)` | Float64 |
+| `Лиды` | `leads` | Для класса EXCL_2A — ненулевая |
+| `Мусор %` | `100. * trash / nullIf(clicks,0)` | Спам-индикатор |
+| `Класс` | `class_` | EXCL_2A / 2B / 2C / 2D — для фильтра в UI |
+| `Что не так` | сгенерируешь по эвристикам ↓ | Главное — индивидуальный комментарий |
+
+11 целевых колонок (все звонки, формы, CRM) **не кладёшь** — они в EXCL-строках по определению нули. Все нужные суррогатные сигналы — **внутри текста колонки «Что не так»**.
+
+**Колонка «Что не так» — пример эвристик** (адаптируй под живые цифры):
+
+```python
+def _detect_type(placement: str) -> str:
+    p = placement.lower()
+    if 'vpn' in p or 'proxy' in p:
+        return "VPN/proxy-приложение"
+    if p.startswith('com.') or p.startswith('app.') or '.android.' in p:
+        return "Мобильное приложение"
+    if 'yandex' in p or 'mail.ru' in p:
+        return "Сервис Яндекса/Mail.ru"
+    if any(s in p for s in ['cian', 'avito', 'domclick', 'realty']):
+        return "Тематическая недвижка"  # обычно KEEP, тут не должно быть
+    if 'dsp-' in p:
+        return "DSP-сетка"
+    return ""
+
+def make_comment(r) -> str:
+    typ = _detect_type(r['Placement'])
+    cost, leads, baseline = r['cost'], r['leads'], r['baseline']
+    trash_share = r.get('trash_share', 0) or 0
+    bounce = r.get('bounce_rate', 0) or 0
+    cls = r['class_']
+
+    if cls == 'EXCL_2A':  # лиды есть, но CPL абсурдный
+        cpl = cost / max(leads, 1)
+        return f"{typ}. {leads} лид(ов) за {cost:.0f} ₽ — CPL {cpl:.0f} ₽ ({cpl/baseline:.1f}× от нормы)."
+    if cls == 'EXCL_2B':  # cost ≥ baseline, 0 лидов, lead_eq < 1
+        leq = r.get('lead_eq', 0) or 0
+        if leq > 0:
+            return f"{typ}. {cost:.0f} ₽, 0 лидов; суррогаты ≈ {leq:.2f} лида (<1) — не покрывают расход."
+        return f"{typ}. {cost:.0f} ₽ потрачено, 0 лидов, ноль суррогатов."
+    if cls == 'EXCL_2C':  # cost ≥ 3000, ≥10 кликов, ноль ВСЕХ целей
+        return f"{typ}. {cost:.0f} ₽ при {int(r['clicks'])} кликах — ни одного целевого действия."
+    if cls == 'EXCL_2D':  # микро-мусор
+        sigs = []
+        if bounce >= 50: sigs.append(f"отказы {bounce:.0f}%")
+        if trash_share >= 50: sigs.append(f"мусор {trash_share:.0f}%")
+        return f"{typ}. Микро-расход {cost:.0f} ₽, {' / '.join(sigs)}, 0 целей."
+    return ""
+```
+
+**Стандартный сборщик в python_analysis:**
+
+```python
+import pandas as pd
+df = pd.read_parquet(parquet_path)   # сырой от clickhouse_query
+
+excl = df[df['class_'].str.startswith('EXCL_')].copy()
+excl['Цена клика, ₽'] = excl['cost'] / excl['clicks'].clip(lower=1)
+excl['Мусор %'] = 100.0 * excl['trash'] / excl['clicks'].clip(lower=1)
+excl['Что не так'] = excl.apply(make_comment, axis=1)
+
+excl = excl.rename(columns={
+    'camp_name': 'Кампания', 'camp_id': 'ID кампании',
+    'cost': 'Расход, ₽', 'clicks': 'Клики',
+    'leads': 'Лиды', 'class_': 'Класс',
+})[['Кампания', 'ID кампании', 'Площадка',
+    'Расход, ₽', 'Клики', 'Цена клика, ₽',
+    'Лиды', 'Мусор %', 'Класс', 'Что не так']]
+
+excl = excl.sort_values(['Кампания', 'Расход, ₽'], ascending=[True, False])
+excl.to_parquet('/parquet/placements_excludes.parquet')
+
+print(f"saved: /parquet/placements_excludes.parquet, {len(excl)} rows")
+```
+
+В `parquet_paths` кладёшь `/parquet/placements_excludes.parquet`. Это и есть «полный список с объяснениями для каждой площадки», который маркетолог откроет в UI и пролистает все 80+ строк. UI рендерит по колонкам словаря, фильтрует по Кампании / Классу, сортирует по Расходу — без дополнительных тулов.
+
+(При желании можешь дополнительно положить агрегированный parquet «по кампаниям» — но это уже не обязательное; одного `placements_excludes.parquet` хватает.)
 
 ---
 
