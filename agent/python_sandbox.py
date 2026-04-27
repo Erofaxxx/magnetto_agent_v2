@@ -368,10 +368,10 @@ class PythonSandbox:
                 result_value = str(result_value)
 
             # ── Truncate stdout to avoid flooding LLM context ──────────────
-            # 8 000 chars ≈ 100-150 rows of tabular data — enough to understand
-            # structure and values without causing context explosion.
+            # 4 000 chars ≈ 50-80 rows of tabular data — enough to debug,
+            # not enough to dump full datasets (those belong in parquet).
             # head+tail strategy keeps both schema rows and tail rows visible.
-            _MAX_OUTPUT = 8000
+            _MAX_OUTPUT = 4000
             raw_output = stdout_capture.getvalue()
             if len(raw_output) > _MAX_OUTPUT:
                 half = _MAX_OUTPUT // 2
@@ -385,8 +385,16 @@ class PythonSandbox:
             # ── Auto-fill result from stdout when not explicitly set ───────
             # If the agent only used print() and forgot result, we use stdout
             # directly — no extra tool call needed to "fix" it.
+            #
+            # IMPORTANT: when this fires, the LLM tool message would otherwise
+            # contain identical content TWICE (in `output` and in `result`),
+            # doubling cache-prefix bloat across iterations. We track the flag
+            # and blank `output` in the return dict — content is preserved in
+            # `result`, the model sees one copy.
+            result_was_autofilled = False
             if result_value is None and raw_output.strip():
                 result_value = raw_output
+                result_was_autofilled = True
 
             # ── Detect Python code leaked into result via broken f-strings ──
             # Pattern: f"{val:.1f} if pd.notna(val) else '—'" produces a
@@ -405,7 +413,9 @@ class PythonSandbox:
 
             # ── Truncate result variable ────────────────────────────────────
             # result is shown to the user; keep it readable but bounded.
-            _MAX_RESULT = 12000
+            # 4K matches the stdout cap — combined with auto-fill dedup below
+            # this caps a single tool message at ~4K chars max.
+            _MAX_RESULT = 4000
             if result_value and len(result_value) > _MAX_RESULT:
                 half_r = _MAX_RESULT // 2
                 result_value = (
@@ -416,7 +426,11 @@ class PythonSandbox:
 
             return {
                 "success": True,
-                "output": raw_output,
+                # Blank output when result was just auto-filled from stdout —
+                # preserves a single copy of the content (in `result`) and
+                # halves tool-message size.  When the agent set result
+                # explicitly, output is real stdout (debug trace) and stays.
+                "output": "" if result_was_autofilled else raw_output,
                 "result": result_value,
                 "plots": plots,
                 "error": None,
