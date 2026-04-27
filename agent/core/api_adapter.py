@@ -352,10 +352,21 @@ def _extract_parquet_paths(messages: list) -> list[str]:
             if data.get("parquet_path"):
                 _add(data["parquet_path"])
 
-        # 2) SubagentResult tool call — the structured response from a
-        #    subagent. The model puts its parquet_paths there. Some of them
-        #    may be virtual already, some absolute, some completely made up
-        #    (model hallucinated a filename). Normalize what we can.
+        # 2) `task` tool — deepagents' delegation primitive. Its tool message
+        #    is the serialized SubagentResult (summary + parquet_paths + ...)
+        #    coming back from the subagent. THIS is what main agent sees for
+        #    placements-auditor's parquet_paths (the subagent's own
+        #    SubagentResult ToolMessage lives in the subagent's private
+        #    namespace, not in main's message stream).
+        #
+        #    Also kept `SubagentResult` branch below for safety (used when this
+        #    function is called against subagent's own message stream, e.g.
+        #    debugging/testing).
+        if name == "task" and isinstance(data, dict):
+            for p in (data.get("parquet_paths") or []):
+                if isinstance(p, str):
+                    _add(p)
+
         if name == "SubagentResult" and isinstance(data, dict):
             for p in (data.get("parquet_paths") or []):
                 if isinstance(p, str):
