@@ -52,45 +52,48 @@ def _count_tool_calls(state: dict) -> int:
 
 
 def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None:
-    """Append a short budget notice to the system prompt (safe for caching)."""
+    """Inject a short budget notice as a transient SystemMessage at the END of
+    the conversation (suffix), NOT as an append to the global system_message.
+
+    Why: appending to system_message changes the cached prefix on every call
+    (the «N/M итераций» counter increments each turn). Anthropic auto-cache
+    treats this as a fresh prefix → cache miss EVERY iteration once the
+    threshold kicks in (was burning ~$0.30/iter from iter 10 onwards on long
+    sub runs).
+
+    Adding a fresh SystemMessage at the very end keeps messages 0..N-1 byte-
+    identical to the previous turn → those still hit cache. Only the new tail
+    is uncached, which is correct.
+    """
     remaining = budget - used
     if remaining > 10:
         return
     if remaining <= 0:
         note = (
-            f"\n\n[⛔ ЛИМИТ ИСЧЕРПАН ({used}/{budget}). "
+            f"[⛔ ЛИМИТ ИСЧЕРПАН ({used}/{budget}). "
             "Немедленно дай финальный ответ на основе уже собранных данных. "
             "НЕ вызывай инструменты.]"
         )
     elif remaining <= 2:
         note = (
-            f"\n\n[🚨 Почти исчерпан ({used}/{budget}). Осталось {remaining} вызовов. "
+            f"[🚨 Почти исчерпан ({used}/{budget}). Осталось {remaining} вызовов. "
             "Используй только если критически необходимо. После — финальный ответ.]"
         )
     elif remaining <= 5:
         note = (
-            f"\n\n[⚠ Мало итераций ({used}/{budget}). Осталось {remaining}. "
+            f"[⚠ Мало итераций ({used}/{budget}). Осталось {remaining}. "
             "Объединяй оставшиеся запросы через WITH/CTE, не дроби на шаги.]"
         )
     else:  # 6..10
-        note = f"\n\n[⚡ {used}/{budget} итераций использовано, осталось {remaining}.]"
+        note = f"[⚡ {used}/{budget} итераций использовано, осталось {remaining}.]"
 
-    # Append to system_message (it's dynamic; cache может не хитнуть на этом блоке,
-    # но это нормально — стабильная часть system prompt (AGENTS.md etc.) выше и
-    # помечена CachingMiddleware, а этот блок меняется часто и НЕ помечается кэшем.
-    # Главное — он идёт ПОСЛЕ кэшированного блока, т.к. у нас 3 breakpoints ставит
-    # CachingMiddleware. Здесь же мы просто не трогаем cache_control — просто
-    # добавляем text блок.
-    if request.system_message is None:
-        request.system_message = SystemMessage(content=note)
-    else:
-        content = request.system_message.content
-        if isinstance(content, str):
-            request.system_message.content = content + note
-        elif isinstance(content, list):
-            new = list(content)
-            new.append({"type": "text", "text": note})
-            request.system_message.content = new
+    # Append a fresh SystemMessage to request.messages (suffix). This message is
+    # NOT cached on subsequent turns (it's regenerated each call with new
+    # numbers), but the prefix before it stays stable → cache hit on the
+    # heavy part.
+    if request.messages is None:
+        request.messages = []
+    request.messages = list(request.messages) + [SystemMessage(content=note)]
 
 
 class BudgetMiddleware(AgentMiddleware):

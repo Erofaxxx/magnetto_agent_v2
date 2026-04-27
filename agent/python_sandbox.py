@@ -330,6 +330,19 @@ class PythonSandbox:
         # the guard so the sandbox's own cleanup calls work normally.
         _tls.exec_active = True
 
+        # ── Pandas display caps for the duration of exec ───────────────────
+        # Prevent agent's `print(df)` / `print(df.head(500))` from blowing up
+        # stdout to 50K+ chars. _MAX_OUTPUT below is the final safety net, but
+        # we cap pandas BEFORE truncation kicks in so the model sees a clean
+        # truncated table rather than a chopped one.
+        _saved_display = {
+            opt: pd.get_option(opt)
+            for opt in ("display.max_rows", "display.max_columns", "display.width")
+        }
+        pd.set_option("display.max_rows", 100)
+        pd.set_option("display.max_columns", 30)
+        pd.set_option("display.width", 200)
+
         try:
             # ── Execute code ────────────────────────────────────────────────
             exec(code, sandbox_globals)  # noqa: S102
@@ -437,6 +450,9 @@ class PythonSandbox:
             # Restore rcParams to pre-exec state so agent code cannot
             # permanently change styles for subsequent calls.
             plt.rcParams.update(_saved_rc)
+            # Restore pandas display options as well — same reason.
+            for opt, val in _saved_display.items():
+                pd.set_option(opt, val)
             # Close only figures created by THIS call, not figures from
             # other parallel calls that may still be running.
             with _figure_lock:
