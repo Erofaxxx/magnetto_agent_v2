@@ -66,7 +66,19 @@ def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None
     is uncached, which is correct.
     """
     remaining = budget - used
-    if remaining > 10:
+    # Only fire on hard-limit thresholds. The previous soft hints (⚡ at
+    # remaining≤10 and ⚠ at remaining≤5) were appended to the message stream
+    # every iteration, with a different counter each time. Auto-cache (Anthropic
+    # via OpenRouter `cache_control: ephemeral`) places its breakpoint on the
+    # last message — so the changing counter text in the trailing position
+    # invalidated the cached prefix on EVERY iteration past iter 10. Net effect
+    # on a 20-iter sub: ~10 cache misses × ~$0.20 = ~$2 wasted per session.
+    #
+    # Now the notice fires only when the model needs to actually adjust its
+    # behavior (slow down at 🚨, stop tools at ⛔). That's at most 2 cache
+    # breakpoint shifts per session — and in the typical case where the sub
+    # finishes in <18 iters, zero shifts.
+    if remaining > 2:
         return
     if remaining <= 0:
         note = (
@@ -74,18 +86,11 @@ def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None
             "Немедленно дай финальный ответ на основе уже собранных данных. "
             "НЕ вызывай инструменты.]"
         )
-    elif remaining <= 2:
+    else:  # remaining 1..2
         note = (
             f"[🚨 Почти исчерпан ({used}/{budget}). Осталось {remaining} вызовов. "
             "Используй только если критически необходимо. После — финальный ответ.]"
         )
-    elif remaining <= 5:
-        note = (
-            f"[⚠ Мало итераций ({used}/{budget}). Осталось {remaining}. "
-            "Объединяй оставшиеся запросы через WITH/CTE, не дроби на шаги.]"
-        )
-    else:  # 6..10
-        note = f"[⚡ {used}/{budget} итераций использовано, осталось {remaining}.]"
 
     # Append a fresh SystemMessage to request.messages (suffix). This message is
     # NOT cached on subsequent turns (it's regenerated each call with new
