@@ -161,6 +161,33 @@ def _safe_read_parquet(path, *args, **kwargs):
 pd.read_parquet = _safe_read_parquet
 
 
+# ─── Virtual `/parquet/<file>` write support ──────────────────────────────────
+# Agent code calls e.g. `df.to_parquet('/parquet/my_slice.parquet')`. The
+# absolute filesystem has no /parquet/ directory, so a naive call hits
+# `OSError: Cannot save file into a non-existent directory: '/parquet'`. We
+# remap the virtual path to the current session's parquet directory at write
+# time, transparently to agent code. The frontend's parquet preview endpoint
+# already speaks the same `/parquet/<file>` namespace, so the round-trip works.
+_orig_pd_to_parquet = pd.DataFrame.to_parquet
+
+
+def _virtual_to_parquet(self, path=None, *args, **kwargs):
+    """Map `/parquet/<file>` → `<session.parquet_dir>/<file>` before writing."""
+    if isinstance(path, str) and path.startswith("/parquet/"):
+        try:
+            from core.session_context import get_current_session
+            sess = get_current_session()
+            if sess is not None:
+                target_dir = sess.parquet_dir  # auto-creates if missing
+                path = str(target_dir / path[len("/parquet/"):])
+        except Exception:
+            pass  # fall through, original error will surface
+    return _orig_pd_to_parquet(self, path, *args, **kwargs)
+
+
+pd.DataFrame.to_parquet = _virtual_to_parquet
+
+
 class _PlotProxy:
     """
     Proxy for matplotlib.pyplot injected into the agent's execution namespace
