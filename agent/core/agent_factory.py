@@ -50,6 +50,7 @@ _OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 _MODEL = os.environ.get("MODEL", "anthropic/claude-sonnet-4.6")
 _MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
 _MAX_ITERATIONS = int(os.environ.get("MAX_AGENT_ITERATIONS", "30"))
+_MAX_SUBAGENT_ITERATIONS = int(os.environ.get("MAX_SUBAGENT_ITERATIONS", "20"))
 
 _OPENROUTER_HEADERS = {
     "HTTP-Referer": "https://server.asktab.ru",
@@ -201,9 +202,16 @@ def build_agent(
         # Strip any pre-existing copies to enforce correct order
         existing_mw = [
             m for m in existing_mw
-            if not isinstance(m, (DynamicContextMiddleware, CachingMiddleware))
+            if not isinstance(m, (DynamicContextMiddleware, CachingMiddleware, BudgetMiddleware))
         ]
-        spec["middleware"] = [DynamicContextMiddleware(), CachingMiddleware()] + existing_mw
+        # ВАЖНО: BudgetMiddleware у каждого подагента — без него subagent может
+        # уйти в бесконечный retry-цикл (например, при невалидном structured-output
+        # из-за обрезания на max_tokens). Уже было: 351 итерация = $17 за один запрос.
+        spec["middleware"] = [
+            DynamicContextMiddleware(),
+            CachingMiddleware(),
+            BudgetMiddleware(max_iterations=_MAX_SUBAGENT_ITERATIONS),
+        ] + existing_mw
 
     # ── Checkpointer (per-process single conn) ──────────────────────────
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
