@@ -48,7 +48,7 @@ _DB_PATH = os.environ.get("DB_PATH") or str(
 )
 _OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 _MODEL = os.environ.get("MODEL", "anthropic/claude-sonnet-4.6")
-_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "8192"))
+_MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "16384"))
 _MAX_ITERATIONS = int(os.environ.get("MAX_AGENT_ITERATIONS", "30"))
 _MAX_SUBAGENT_ITERATIONS = int(os.environ.get("MAX_SUBAGENT_ITERATIONS", "20"))
 
