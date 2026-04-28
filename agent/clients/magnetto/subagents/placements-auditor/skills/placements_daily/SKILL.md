@@ -108,8 +108,8 @@ lead_eq = Σ для каждой цели X из [calls, phone_clicks, auto_form
 
 | Шаг | Условие | Класс |
 |---|---|---|
-| 0 | `max(Date) < today() - 20` | `STALE` (отсеять) |
-| 1.1 | `crm_paid > 0` ИЛИ `crm_created > 0` | `GOLD` |
+| 0 | `crm_paid > 0` ИЛИ `crm_created > 0` | `GOLD` (имеет приоритет над свежестью — CRM не теряется) |
+| 1.1 | `max(Date) < today() - 20` | `STALE` (отсеять, кроме CRM-площадок выше) |
 | 1.2 | `goal_all_leads >= 3` | `KEEP_3PLUS` |
 | 1.3 | `goal_all_leads >= 1` И `cost/leads <= 5×baseline` | `KEEP_LEAD_OK` |
 | 3 | `clicks = 0` И `impressions > 0` | `MEDIA` |
@@ -189,8 +189,8 @@ WITH
         + coalesce(b.phone_mag * w.w_pmag, 0)
         + coalesce(b.auto_form * w.w_af, 0) AS lead_eq,
       multiIf(
-        b.last_date < today() - 20,                              'STALE',
         b.crm_paid > 0 OR b.crm_created > 0,                     'GOLD',
+        b.last_date < today() - 20,                              'STALE',
         b.leads >= 3,                                            'KEEP_3PLUS',
         b.leads >= 1 AND b.cost / b.leads <= 5 * if(c.leads_camp >= 5, c.cpl_camp, cc.cpl_cab),
                                                                  'KEEP_LEAD_OK',
@@ -310,6 +310,18 @@ ORDER BY camp_id, multiIf(class_ LIKE 'EXCL_%', 1, class_ IN ('GOLD','KEEP_3PLUS
 - Подробности по каждой кампании ниже
 ```
 
+**ВАЖНО — все цифры в шапке «В двух словах» должны быть из ОДНОГО пула** (полный за период, БЕЗ фильтра свежести). SQL Шаблона 0 отсеивает `STALE` через `WHERE class_ != 'STALE'`, поэтому суммы из его parquet — НЕ полные. Перед формированием шапки сделай отдельный короткий SELECT без фильтра свежести:
+
+```sql
+SELECT
+  round(sum(cost), 0)                              AS cost_total,
+  sum(goal_all_leads)                              AS leads_total,
+  sum(goal_crm_paid) + sum(goal_crm_created)       AS crm_events,
+  countDistinct(Placement)                         AS uniq_total
+FROM magnetto.placements_daily
+WHERE cabinet_name = '{cabinet}' AND Date BETWEEN '{dfrom}' AND '{dto}'
+```
+
 Если за период `leads_cab = 0` (фолбэк 15 000 ₽) — добавь абзац: «За период в кабинете 0 лидов в композитной цели. Норма цены лида взята как фолбэк 15 000 ₽. Цифры исключений могут быть консервативными — проверь, не отключена ли передача лидов в Метрике.»
 
 ### 7.2. Раздел «По кампаниям» — главный
@@ -377,6 +389,20 @@ ORDER BY camp_id, multiIf(class_ LIKE 'EXCL_%', 1, class_ IN ('GOLD','KEEP_3PLUS
 |---|---|---|---|---|---|---|
 | ... | ... | ... | ... | ... | ... | ... |
 | **ИТОГО** | — | {Σ} | {Σ} | {Σ} | {Σ} | {Σ} |
+```
+
+**Сводка обязательно содержит ВСЕ кампании за период.** Не строй её из curated excl-parquet — он по определению не содержит кампании без исключений (Раздел 10.1 кладёт только `EXCL_*`). Источник для сводки — отдельный плоский SELECT по `placements_daily` без фильтра `class_`:
+
+```sql
+SELECT
+  CampaignId             AS camp_id,
+  any(CampaignName)      AS camp_name,
+  round(sum(cost), 0)    AS cost_camp,
+  sum(goal_all_leads)    AS leads_camp
+FROM magnetto.placements_daily
+WHERE cabinet_name = '{cabinet}' AND Date BETWEEN '{dfrom}' AND '{dto}'
+GROUP BY CampaignId
+ORDER BY cost_camp DESC
 ```
 
 ### 7.4. Общий ответ «куда уйдёт трафик»
