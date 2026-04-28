@@ -25,7 +25,7 @@ description: |
   НЕ используй для: snapshot-аудита `bad_placements`/`bad_keywords`/`bad_queries`,
   настроек кампаний/групп/объявлений, ROAS-отчётов по `dm_direct_performance`,
   client-level / scoring / command-center вопросов.
-model: anthropic/claude-sonnet-4.6
+model: anthropic/claude-opus-4.7
 schema_tables:
   - placements_daily
   - placements_goal_calibration
