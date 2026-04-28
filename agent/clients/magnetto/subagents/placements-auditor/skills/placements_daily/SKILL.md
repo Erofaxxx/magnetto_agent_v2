@@ -108,8 +108,8 @@ lead_eq = Σ для каждой цели X из [calls, phone_clicks, auto_form
 
 | Шаг | Условие | Класс |
 |---|---|---|
-| 1.1 | `crm_paid > 0` ИЛИ `crm_created > 0` | `GOLD` (имеет приоритет над свежестью — CRM не теряется) |
-| 0 | `max(Date) < today() - 20` | `STALE` (отсеять, кроме CRM-площадок выше) |
+| 0 | `crm_paid > 0` ИЛИ `crm_created > 0` | `GOLD` (имеет приоритет над свежестью — CRM не теряется) |
+| 1.1 | `max(Date) < today() - 20` | `STALE` (отсеять, кроме CRM-площадок выше) |
 | 1.2 | `goal_all_leads >= 3` | `KEEP_3PLUS` |
 | 1.3 | `goal_all_leads >= 1` И `cost/leads <= 5×baseline` | `KEEP_LEAD_OK` |
 | 3 | `clicks = 0` И `impressions > 0` | `MEDIA` |
