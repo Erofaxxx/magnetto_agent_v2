@@ -31,6 +31,7 @@ MAX_TOKENS: int = int(os.environ.get("MAX_TOKENS", "8192"))
 # Provider determines prompt-caching strategy and extra_body settings.
 ALLOWED_MODELS: dict[str, str] = {
     "anthropic/claude-sonnet-4.6": "anthropic",
+    "anthropic/claude-opus-4.7": "anthropic",
     "deepseek/deepseek-v3.2": "deepseek",
 }
 
