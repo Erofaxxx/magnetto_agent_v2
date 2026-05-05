@@ -1,27 +1,37 @@
 """
-ChatLogger — passive observer for agent runs.
+ChatLogger — full-fidelity event log for agent runs.
 
-Writes full-fidelity event logs to `agent_logs` table in the SAME SQLite DB
-as SqliteSaver, but in a completely separate table.
+Two writing modes coexist:
+  - log_turn(): post-hoc, called from api_server.py after agent finishes.
+    Walks the messages and writes everything in one batch. Legacy mode,
+    sufficient for v1 (single agent).
+  - log_event(): real-time, called from ConversationLoggerMiddleware on
+    every model_call / tool_call. Required for v2 (deepagents) so that
+    subagent events (their SQL, their thinking) are captured — they would
+    otherwise be invisible because main only sees the SubagentResult summary.
 
-Key design constraints:
-  - Agent knows NOTHING about this module.
-  - Logger is called AFTER agent.analyze() returns, from api_server.py.
-  - Any exception in logger is caught silently — never propagates to agent.
-  - Uses WAL mode to coexist safely with SqliteSaver writes.
+Both modes write into the same `agent_logs` table. log_turn checks
+idempotency (skip if turn already has rows) so middleware-written events
+take precedence; log_turn fills in only if middleware was disabled.
 
 Table: agent_logs
-  id            INTEGER PRIMARY KEY AUTOINCREMENT
-  session_id    TEXT     — LangGraph thread_id
-  turn_index    INTEGER  — 1-based, = number of HumanMessages seen so far
-  seq           INTEGER  — ordering within a turn (0, 1, 2, ...)
-  event_type    TEXT     — 'human' | 'ai_thinking' | 'tool_call' | 'tool_result' | 'ai_answer'
-  tool_name     TEXT     — 'clickhouse_query' | 'python_analysis' | 'list_tables' | NULL
-  tool_call_id  TEXT     — links tool_call ↔ tool_result pair
-  content       TEXT     — full content (SQL, code, JSON result, text)
-  token_est     INTEGER  — rough token estimate (len/4) for cost analysis
-  duration_ms   INTEGER  — NULL (reserved for future per-call timing)
-  created_at    TEXT     — ISO-8601 UTC timestamp
+  id                   INTEGER PRIMARY KEY AUTOINCREMENT
+  session_id           TEXT     — LangGraph thread_id
+  turn_index           INTEGER  — 1-based, = number of HumanMessages seen so far
+  seq                  INTEGER  — ordering within a turn (0, 1, 2, ...)
+  event_type           TEXT     — 'human' | 'ai_thinking' | 'ai_thinking_extended' |
+                                  'tool_call' | 'tool_result' | 'ai_answer' | 'router_result'
+  tool_name            TEXT     — 'clickhouse_query' | 'python_analysis' | 'task' | NULL
+  tool_call_id         TEXT     — links tool_call ↔ tool_result pair
+  content              TEXT     — full content (SQL, code, JSON result, text)
+  token_est            INTEGER  — rough token estimate (len/4) for cost analysis
+  duration_ms          INTEGER  — NULL (reserved for future per-call timing)
+  created_at           TEXT     — ISO-8601 UTC timestamp
+  agent_role           TEXT     — 'main' | 'sub:<name>' | 'unknown' (NULL for legacy rows)
+  parent_tool_call_id  TEXT     — id of the main-agent task() that spawned this subagent event
+
+The two new columns are added via ALTER TABLE on first init; older rows
+keep them NULL.
 """
 
 import json
@@ -71,25 +81,48 @@ class ChatLogger:
 
     def _init_schema(self) -> None:
         with self._lock:
+            # Step 1: ensure base table exists. Schema must include the two
+            # new columns (agent_role, parent_tool_call_id) so fresh DBs are
+            # created with them; pre-existing DBs with the old schema are
+            # patched in step 2.
             self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS agent_logs (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id   TEXT    NOT NULL,
-                    turn_index   INTEGER NOT NULL,
-                    seq          INTEGER NOT NULL,
-                    event_type   TEXT    NOT NULL,
-                    tool_name    TEXT,
-                    tool_call_id TEXT,
-                    content      TEXT,
-                    token_est    INTEGER,
-                    duration_ms  INTEGER,
-                    created_at   TEXT    NOT NULL
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id          TEXT    NOT NULL,
+                    turn_index          INTEGER NOT NULL,
+                    seq                 INTEGER NOT NULL,
+                    event_type          TEXT    NOT NULL,
+                    tool_name           TEXT,
+                    tool_call_id        TEXT,
+                    content             TEXT,
+                    token_est           INTEGER,
+                    duration_ms         INTEGER,
+                    created_at          TEXT    NOT NULL,
+                    agent_role          TEXT,
+                    parent_tool_call_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_logs_session
                     ON agent_logs(session_id, turn_index, seq);
                 CREATE INDEX IF NOT EXISTS idx_logs_created
                     ON agent_logs(created_at);
             """)
+            # Step 2: migrate old schemas (SQLite has no ALTER TABLE … IF NOT
+            # EXISTS — try, swallow OperationalError if the column already
+            # exists). Must run BEFORE creating an index that references the
+            # new column.
+            for ddl in (
+                "ALTER TABLE agent_logs ADD COLUMN agent_role TEXT",
+                "ALTER TABLE agent_logs ADD COLUMN parent_tool_call_id TEXT",
+            ):
+                try:
+                    self._conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
+            # Step 3: index that depends on the migrated column.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_logs_parent "
+                "ON agent_logs(parent_tool_call_id)"
+            )
             self._conn.commit()
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -109,6 +142,54 @@ class ChatLogger:
         except Exception as exc:
             # Never let logger errors reach the caller (agent result is already returned)
             print(f"[ChatLogger] WARNING: log_turn failed silently: {exc}")
+
+    def log_event(
+        self,
+        *,
+        session_id: str,
+        turn_index: int,
+        event_type: str,
+        agent_role: str,
+        tool_name: Optional[str],
+        tool_call_id: Optional[str],
+        parent_tool_call_id: Optional[str],
+        content: str,
+        created_at: str,
+    ) -> None:
+        """
+        Write a single event in real time.
+
+        Used by ConversationLoggerMiddleware to capture every model_call /
+        tool_call across main agent and all subagents as they happen.
+
+        seq is auto-assigned: max(seq) + 1 for the (session, turn) pair.
+        Completely safe — all exceptions are swallowed so a logging failure
+        cannot break the agent execution path.
+        """
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    "SELECT COALESCE(MAX(seq), -1) + 1 FROM agent_logs "
+                    "WHERE session_id = ? AND turn_index = ?",
+                    (session_id, turn_index),
+                )
+                seq = cur.fetchone()[0]
+                token_est = (len(content) // 4) if content else 0
+                self._conn.execute(
+                    """INSERT INTO agent_logs
+                       (session_id, turn_index, seq, event_type, tool_name,
+                        tool_call_id, content, token_est, duration_ms, created_at,
+                        agent_role, parent_tool_call_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        session_id, turn_index, seq, event_type, tool_name,
+                        tool_call_id, content, token_est, None, created_at,
+                        agent_role, parent_tool_call_id,
+                    ),
+                )
+                self._conn.commit()
+        except Exception as exc:
+            print(f"[ChatLogger] WARNING: log_event failed silently: {exc}")
 
     def log_router(
         self,
@@ -134,10 +215,12 @@ class ChatLogger:
                 self._conn.execute(
                     """INSERT INTO agent_logs
                        (session_id, turn_index, seq, event_type, tool_name,
-                        tool_call_id, content, token_est, duration_ms, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        tool_call_id, content, token_est, duration_ms, created_at,
+                        agent_role, parent_tool_call_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (session_id, turn_index, -1, "router_result", None,
-                     None, content, len(content) // 4, None, created_at),
+                     None, content, len(content) // 4, None, created_at,
+                     "main", None),
                 )
                 self._conn.commit()
         except Exception as exc:
@@ -147,7 +230,8 @@ class ChatLogger:
         """Return all events for a session, ordered by turn and seq."""
         cur = self._conn.execute(
             """SELECT id, turn_index, seq, event_type, tool_name,
-                      tool_call_id, content, token_est, created_at
+                      tool_call_id, content, token_est, created_at,
+                      agent_role, parent_tool_call_id
                FROM agent_logs
                WHERE session_id = ?
                ORDER BY turn_index, seq, id""",
@@ -177,7 +261,8 @@ class ChatLogger:
         """All events for one specific turn."""
         cur = self._conn.execute(
             """SELECT id, seq, event_type, tool_name, tool_call_id,
-                      content, token_est, created_at
+                      content, token_est, created_at,
+                      agent_role, parent_tool_call_id
                FROM agent_logs
                WHERE session_id = ? AND turn_index = ?
                ORDER BY seq, id""",
@@ -185,6 +270,37 @@ class ChatLogger:
         )
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_turn_tree(self, session_id: str, turn_index: int) -> list[dict]:
+        """
+        Return events for a turn structured as a tree:
+        each main-agent task() tool_call has a `subagent_events` array
+        with all sub events whose parent_tool_call_id matches that task.
+
+        Useful for UI: shows "main called direct-optimizer → which ran these
+        SQLs and produced this answer" as a single nested block.
+        """
+        events = self.get_turn(session_id, turn_index)
+        # Index sub events by parent_tool_call_id
+        children: dict[str, list[dict]] = {}
+        main_events: list[dict] = []
+        for ev in events:
+            parent = ev.get("parent_tool_call_id")
+            if parent:
+                children.setdefault(parent, []).append(ev)
+            else:
+                main_events.append(ev)
+        # Attach children to main task() events
+        for ev in main_events:
+            if ev.get("event_type") == "tool_call" and ev.get("tool_name") == "task":
+                tc_id = ev.get("tool_call_id")
+                if tc_id and tc_id in children:
+                    ev["subagent_events"] = children.pop(tc_id)
+        # Orphans (sub events whose parent task() is missing for some reason) —
+        # append at the end so nothing is silently dropped.
+        if children:
+            main_events.append({"orphan_subagent_events": children})
+        return main_events
 
     def get_stats(self) -> dict:
         """Aggregate stats across all sessions — useful for optimization analysis."""
@@ -237,6 +353,11 @@ class ChatLogger:
             rows = []
             seq = 0
 
+            # Legacy log_turn only sees the main-agent message stream — events
+            # produced inside subagents are not present in this list. Therefore
+            # everything written here is tagged agent_role='main' with
+            # parent_tool_call_id=NULL. ConversationLoggerMiddleware (when
+            # enabled) writes subagent events separately in real time.
             for msg in messages[last_human_idx:]:
 
                 if isinstance(msg, HumanMessage):
@@ -283,8 +404,9 @@ class ChatLogger:
                 self._conn.executemany(
                     """INSERT INTO agent_logs
                        (session_id, turn_index, seq, event_type, tool_name,
-                        tool_call_id, content, token_est, duration_ms, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        tool_call_id, content, token_est, duration_ms, created_at,
+                        agent_role, parent_tool_call_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                     rows,
                 )
                 self._conn.commit()
@@ -295,9 +417,13 @@ class ChatLogger:
 def _row(session_id, turn_index, seq, event_type,
          tool_name, tool_call_id, content, created_at):
     token_est = len(content) // 4 if content else 0
+    # Legacy log_turn only sees main-agent messages → agent_role='main',
+    # no parent. Real-time subagent events go through log_event() with
+    # the proper parent_tool_call_id set by ConversationLoggerMiddleware.
     return (session_id, turn_index, seq, event_type,
             tool_name, tool_call_id, content,
-            token_est, None, created_at)
+            token_est, None, created_at,
+            "main", None)
 
 
 def _to_text(content) -> str:

@@ -29,6 +29,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 from .caching_middleware import CachingMiddleware
 from .budget_middleware import BudgetMiddleware
+from .conversation_logger_middleware import ConversationLoggerMiddleware
 from .dynamic_context_middleware import DynamicContextMiddleware
 from .enforcement_middleware import HardcodeDetector
 from .exploration_tools import make_describe_table_tool, make_sample_table_tool
@@ -194,6 +195,14 @@ def build_agent(
     # DynamicContext FIRST: today+VAT попадают в system prompt ДО вызова
     # модели и автоматически оказываются в auto-кэше Anthropic.
     # CachingMiddleware — только лог usage stats.
+    #
+    # ConversationLoggerMiddleware — общий экземпляр, разделяемый между main
+    # и всеми подагентами. Он stateless; единственный shared state —
+    # ContextVar'ы для parent_tool_call_id, и они per-coroutine, не per-instance.
+    # Помещён первым (outermost), чтобы видеть события до того, как другие
+    # middleware что-то отфильтруют (HardcodeDetector, ToolExclusion).
+    conversation_logger = ConversationLoggerMiddleware()
+
     for spec in subagent_specs:
         mdl = spec.get("model")
         if isinstance(mdl, str):
@@ -202,12 +211,18 @@ def build_agent(
         # Strip any pre-existing copies to enforce correct order
         existing_mw = [
             m for m in existing_mw
-            if not isinstance(m, (DynamicContextMiddleware, CachingMiddleware, BudgetMiddleware))
+            if not isinstance(m, (
+                ConversationLoggerMiddleware,
+                DynamicContextMiddleware,
+                CachingMiddleware,
+                BudgetMiddleware,
+            ))
         ]
         # ВАЖНО: BudgetMiddleware у каждого подагента — без него subagent может
         # уйти в бесконечный retry-цикл (например, при невалидном structured-output
         # из-за обрезания на max_tokens). Уже было: 351 итерация = $17 за один запрос.
         spec["middleware"] = [
+            conversation_logger,
             DynamicContextMiddleware(),
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_SUBAGENT_ITERATIONS),
@@ -239,6 +254,11 @@ def build_agent(
         backend=backend_factory,
         middleware=[
             # ORDER (outermost → innermost):
+            # 0) ConversationLogger — пишет в SQLite каждый model_call /
+            #    tool_call в реальном времени. Outermost, чтобы видеть события
+            #    ДО того, как HardcodeDetector / ToolExclusion их отфильтруют.
+            #    Подключён ОДИН и тот же экземпляр и к main, и к каждому sub —
+            #    он stateless, связь sub→main через ContextVar (см. middleware).
             # 1) DynamicContext — добавляет today+VAT в system prompt. Auto-кэш
             #    Anthropic (см. _build_model.extra_body.cache_control) включает
             #    этот блок в кэшируемый префикс. Cache miss 1 раз в сутки при
@@ -252,6 +272,7 @@ def build_agent(
             #    python_analysis, на wrap_tool_call.
             # RoutingEnforcer убран: main физически не имеет clickhouse_query,
             # больше нечего блокировать.
+            conversation_logger,
             DynamicContextMiddleware(),
             CachingMiddleware(),
             BudgetMiddleware(max_iterations=_MAX_ITERATIONS),

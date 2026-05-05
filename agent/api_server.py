@@ -472,15 +472,19 @@ async def debug_session_logs(session_id: str):
     """
     Full chronological log of a session grouped by turn.
 
-    Each turn contains events in order:
-      human       → user question
-      ai_thinking → agent reasoning before tool use (if any)
-      tool_call   → tool invocation with full args (SQL, Python code, etc.)
-      tool_result → full tool response (row_count, data stats, analysis output)
-      ai_answer   → final agent response shown to user
+    Each event has:
+      event_type           → human | ai_thinking | ai_thinking_extended |
+                             tool_call | tool_result | ai_answer | router_result
+      tool_name            → clickhouse_query | python_analysis | task | ...
+      tool_call_id         → links tool_call ↔ tool_result
+      content              → full content (SQL, code, JSON result, text)
+      agent_role           → 'main' | 'sub:<name>' (e.g. sub:direct-optimizer)
+      parent_tool_call_id  → for sub:* events, the id of the main task() that
+                             spawned them (use /turn/{n}/tree for nested view)
 
-    Useful for: reviewing what SQL the agent wrote, how many iterations it took,
-    whether it used the right tables, whether tool results were large/expensive.
+    Useful for: reviewing what SQL the agent wrote (including subagent SQL),
+    how many iterations it took, whether it used the right tables, whether
+    tool results were large/expensive.
     """
     try:
         from chat_logger import get_logger
@@ -516,8 +520,9 @@ async def debug_session_logs(session_id: str):
 @app.get("/debug/session/{session_id}/turn/{turn_index}", tags=["debug"], summary="Log for one specific turn")
 async def debug_turn_logs(session_id: str, turn_index: int):
     """
-    Detailed event log for a single turn within a session.
-    Useful for deep-diving into one specific question the user asked.
+    Detailed event log for a single turn within a session — flat list ordered
+    by seq. Use /turn/{n}/tree for a nested view with subagent events folded
+    under their parent task() call.
     """
     try:
         from chat_logger import get_logger
@@ -536,6 +541,50 @@ async def debug_turn_logs(session_id: str, turn_index: int):
                 except Exception:
                     pass
         return {"session_id": session_id, "turn_index": turn_index, "events": events}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get(
+    "/debug/session/{session_id}/turn/{turn_index}/tree",
+    tags=["debug"],
+    summary="Turn log as a tree (subagent events nested under task() calls)",
+)
+async def debug_turn_tree(session_id: str, turn_index: int):
+    """
+    Hierarchical view: main-agent events at top level; for every main
+    `task` tool_call event there is a `subagent_events` list with all the
+    subagent's events (its own ai_thinking / tool_call / tool_result /
+    ai_answer) in chronological order.
+
+    Use this to see "main delegated to direct-optimizer → it ran these
+    SQLs → it produced this analysis" as a single nested block instead
+    of interleaved flat events.
+    """
+    try:
+        from chat_logger import get_logger
+        from config import DB_PATH
+        tree = get_logger(DB_PATH).get_turn_tree(session_id, turn_index)
+        if not tree:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Turn {turn_index} not found for session {session_id}",
+            )
+        # Parse JSON content for both main events and nested subagent events.
+        def _parse_inplace(ev: dict) -> None:
+            if ev.get("content"):
+                try:
+                    ev["content"] = json.loads(ev["content"])
+                except Exception:
+                    pass
+            for child in ev.get("subagent_events") or []:
+                _parse_inplace(child)
+        for ev in tree:
+            if isinstance(ev, dict):
+                _parse_inplace(ev)
+        return {"session_id": session_id, "turn_index": turn_index, "tree": tree}
     except HTTPException:
         raise
     except Exception as e:
