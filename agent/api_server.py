@@ -20,16 +20,16 @@ import decimal as _decimal
 import json
 import math as _math
 import uuid
+from contextlib import asynccontextmanager
 from datetime import date as _date, datetime, timezone
 _datetime = datetime  # alias for _serialize_value
 from typing import Optional, Literal
 import uvicorn
-from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-load_dotenv()
+# config.py loads .env exactly once on import; importing it here is enough.
 from config import ALLOWED_MODELS, HOST, MODEL, PORT, SERVER_URL
 
 # ─── deepagents switch ────────────────────────────────────────────────────
@@ -37,6 +37,33 @@ from config import ALLOWED_MODELS, HOST, MODEL, PORT, SERVER_URL
 # (new deepagents-based agent). Otherwise — legacy agent.AnalyticsAgent.
 import os as _os
 _USE_DEEPAGENTS = _os.environ.get("USE_DEEPAGENTS", "0") in ("1", "true", "True", "yes")
+
+
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
+# FastAPI deprecated @app.on_event("startup"/"shutdown") in favour of an
+# async context manager. The lifespan replaces both events and lets us
+# cleanly cancel the cleanup task on shutdown.
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    if _USE_DEEPAGENTS:
+        from core.agent_factory import build_agent
+        await asyncio.to_thread(build_agent, "magnetto", MODEL)
+        print("✅ deepagents ready (USE_DEEPAGENTS=1)")
+    else:
+        from agent import get_agent
+        get_agent()
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    print(f"✅ ClickHouse Analytics Agent API started | {SERVER_URL}")
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="ClickHouse Analytics Agent API",
@@ -47,12 +74,25 @@ app = FastAPI(
     version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=_lifespan,
 )
 # ─── CORS ─────────────────────────────────────────────────────────────────────
+# CORS spec: при allow_credentials=True нельзя использовать "*" в allow_origins.
+# Явный список оригинов задаётся через ENV CORS_ALLOWED_ORIGINS (запятые),
+# например: "https://server.asktab.ru,https://app.asktab.ru".
+# Если переменная пуста — credentials отключаются и используется wildcard
+# (read-only публичный режим).
+_cors_origins_env = (_os.environ.get("CORS_ALLOWED_ORIGINS") or "").strip()
+if _cors_origins_env:
+    _cors_origins = [o.strip() for o in _cors_origins_env.split(",") if o.strip()]
+    _cors_credentials = True
+else:
+    _cors_origins = ["*"]
+    _cors_credentials = False
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_cors_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -177,42 +217,41 @@ async def _run_agent_job(job_id: str) -> None:
         print(f"[job:{job_id}] ERROR: {exc}")
 # ─── Cleanup loop ─────────────────────────────────────────────────────────────
 async def _cleanup_loop() -> None:
-    """Remove expired jobs and parquet files every 30 minutes."""
+    """Remove expired jobs and parquet files every 30 minutes.
+
+    A transient ClickHouse / FS error inside one iteration must not kill the
+    loop — the whole body sits inside try/except so the loop survives until
+    cancelled by lifespan shutdown.
+    """
     while True:
-        await asyncio.sleep(1800)
-        now = datetime.now(timezone.utc).timestamp()
-        # Clean expired jobs
-        expired = [
-            jid for jid, j in list(_jobs.items())
-            if j["status"] in ("done", "error")
-            and j["finished_at"]
-            and (now - datetime.fromisoformat(j["finished_at"]).timestamp()) > JOB_TTL_SECONDS
-        ]
-        for jid in expired:
-            del _jobs[jid]
-        if expired:
-            print(f"[cleanup] Removed {len(expired)} expired job(s)")
-        # Clean parquet files
         try:
-            from agent import get_agent
-            n = await asyncio.to_thread(get_agent().cleanup_temp_files)
-            if n:
-                print(f"[cleanup] Removed {n} expired parquet file(s)")
+            await asyncio.sleep(1800)
+            now = datetime.now(timezone.utc).timestamp()
+            # Clean expired jobs
+            expired = [
+                jid for jid, j in list(_jobs.items())
+                if j["status"] in ("done", "error")
+                and j["finished_at"]
+                and (now - datetime.fromisoformat(j["finished_at"]).timestamp()) > JOB_TTL_SECONDS
+            ]
+            for jid in expired:
+                del _jobs[jid]
+            if expired:
+                print(f"[cleanup] Removed {len(expired)} expired job(s)")
+            # Clean parquet files
+            try:
+                from agent import get_agent
+                n = await asyncio.to_thread(get_agent().cleanup_temp_files)
+                if n:
+                    print(f"[cleanup] Removed {n} expired parquet file(s)")
+            except Exception as exc:
+                print(f"[cleanup] Parquet cleanup error: {exc}")
+        except asyncio.CancelledError:
+            # Propagate cancellation so lifespan can await us cleanly.
+            raise
         except Exception as exc:
-            print(f"[cleanup] Parquet cleanup error: {exc}")
-# ─── Startup ──────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def startup() -> None:
-    if _USE_DEEPAGENTS:
-        # Warm up: schema cache + agent factory build one agent for default model.
-        from core.agent_factory import build_agent
-        await asyncio.to_thread(build_agent, "magnetto", MODEL)
-        print("✅ deepagents ready (USE_DEEPAGENTS=1)")
-    else:
-        from agent import get_agent
-        get_agent()
-    asyncio.create_task(_cleanup_loop())
-    print(f"✅ ClickHouse Analytics Agent API started | {SERVER_URL}")
+            # Any other error — log and keep the loop alive.
+            print(f"[cleanup] Unexpected error: {exc}")
 
 
 # ─── Session files endpoint (deepagents only) ─────────────────────────────────
@@ -833,6 +872,12 @@ async def get_table_data(
                 status_code=400,
                 detail=f"Query '{query_name}' does not support cabinet filter",
             )
+        # Defense in depth: ClickHouse cabinet_name strings are LowCardinality
+        # alphanumerics; reject anything outside that shape BEFORE checking
+        # the runtime allowlist (which is just a cache and could be empty).
+        import re as _re_cab
+        if not _re_cab.match(r"^[A-Za-z0-9_-]+$", cabinet_name):
+            raise HTTPException(status_code=400, detail="Invalid cabinet_name")
         allowed_cabinets = await _get_available_cabinets()
         if cabinet_name not in allowed_cabinets:
             raise HTTPException(
@@ -935,11 +980,11 @@ def _get_reports_client():
 
     try:
         import clickhouse_connect
+        from clickhouse_client import _ch_tls_verify_kwargs
         from config import (
             CLICKHOUSE_HOST,
             CLICKHOUSE_PORT,
             CLICKHOUSE_DATABASE,
-            CLICKHOUSE_SSL_CERT,
         )
         connect_kwargs = {
             "host": CLICKHOUSE_HOST,
@@ -951,11 +996,7 @@ def _get_reports_client():
             "connect_timeout": 30,
             "send_receive_timeout": 600,
         }
-        if CLICKHOUSE_SSL_CERT:
-            connect_kwargs["verify"] = True
-            connect_kwargs["ca_cert"] = CLICKHOUSE_SSL_CERT
-        else:
-            connect_kwargs["verify"] = False
+        connect_kwargs.update(_ch_tls_verify_kwargs())
         _reports_ch_client = clickhouse_connect.get_client(**connect_kwargs)
         print(f"✅ Reports CH client connected as {user}")
         return _reports_ch_client

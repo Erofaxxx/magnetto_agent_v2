@@ -29,6 +29,39 @@ _GREETING_RE = re.compile(
 )
 
 
+def _extract_first_json_array(text: str) -> str:
+    """
+    Return the first balanced JSON array substring in `text`, or the input
+    unchanged if no array is found. Tracks `[`/`]` depth and ignores brackets
+    inside string literals to handle nested arrays correctly.
+    """
+    start = text.find("[")
+    if start == -1:
+        return text
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text
+
+
 def _strip_greeting_prefix(query: str) -> str:
     """
     Remove leading greeting-only lines/paragraphs before routing.
@@ -175,10 +208,11 @@ def classify(query: str, context: list[dict] | None = None) -> list[str]:
         if match:
             raw = match.group(1).strip()
 
-        # Найти первый JSON-массив в ответе
-        arr_match = re.search(r"\[.*?\]", raw, re.DOTALL)
-        if arr_match:
-            raw = arr_match.group(0)
+        # Find the first balanced JSON array in the response. A naive
+        # `\[.*?\]` non-greedy regex breaks on nested structures (e.g.
+        # `[["a"], ["b"]]` cuts at the first `]`); track bracket depth
+        # so we keep the entire top-level array intact.
+        raw = _extract_first_json_array(raw)
 
         parsed = json.loads(raw)
 

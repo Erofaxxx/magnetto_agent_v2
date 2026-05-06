@@ -43,6 +43,70 @@ except Exception:
 sns.set_style("whitegrid")
 sns.set_palette("husl")
 
+
+# ─── Hardened builtins ────────────────────────────────────────────────────────
+# Names removed from `__builtins__` in the exec namespace. This is not a true
+# sandbox — agent code still runs in-process and can theoretically defeat
+# these guards by walking object graphs (e.g. `().__class__.__mro__[1]`).
+# But explicit removal of the obvious foot-guns blocks the common attack
+# patterns (open / eval / exec / subprocess via os) that a prompt-injection
+# string from CRM/ad-platform data could otherwise trigger directly.
+_BLOCKED_BUILTINS: frozenset[str] = frozenset({
+    "eval", "exec", "compile", "open", "input", "breakpoint",
+    "exit", "quit", "help",
+    "__loader__", "__spec__",
+})
+
+# Modules the sandbox is allowed to import. Anything else raises ImportError.
+# pandas/numpy/matplotlib are pre-bound in the namespace, but `import` is also
+# permitted for a curated extras list (datetime/json/math/re/etc.).
+_ALLOWED_IMPORTS: frozenset[str] = frozenset({
+    "pandas", "numpy", "matplotlib", "matplotlib.pyplot", "matplotlib.dates",
+    "matplotlib.ticker", "matplotlib.colors", "matplotlib.patches",
+    "seaborn", "scipy", "scipy.stats", "scipy.signal",
+    "sklearn", "sklearn.cluster", "sklearn.preprocessing",
+    "datetime", "json", "math", "re", "statistics", "collections",
+    "itertools", "functools", "operator", "decimal", "fractions",
+    "calendar", "warnings", "typing",
+})
+
+
+def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """
+    Replacement for `__import__` inside the sandbox.
+
+    Blocks `os`, `subprocess`, `socket`, `pathlib` etc. while letting the
+    analytical libraries through. A submodule like `pandas.io.parquet` is
+    allowed if the top-level package (`pandas`) is in the allowlist.
+    """
+    root = name.split(".", 1)[0]
+    if name in _ALLOWED_IMPORTS or root in _ALLOWED_IMPORTS:
+        return _builtins_module.__import__(name, globals, locals, fromlist, level)
+    raise ImportError(
+        f"Import of '{name}' is not permitted in the sandbox. "
+        f"Allowed: {sorted(_ALLOWED_IMPORTS)}"
+    )
+
+
+def _truncate_on_newlines(text: str, max_len: int, *, label: str = "output") -> str:
+    """
+    Truncate `text` to roughly `max_len` chars, snapping each cut to the
+    nearest newline. Markdown tables and multi-line stdout stay readable
+    instead of being chopped through a row.
+    """
+    if len(text) <= max_len:
+        return text
+    half = max_len // 2
+    head_cut = text.rfind("\n", 0, half)
+    head_cut = head_cut if head_cut > 0 else half
+    tail_cut = text.find("\n", len(text) - half)
+    tail_cut = tail_cut + 1 if tail_cut != -1 else len(text) - half
+    return (
+        text[:head_cut]
+        + f"\n… [{label} truncated: {len(text)} chars total] …\n"
+        + text[tail_cut:]
+    )
+
 # ─── Thread-local guard: plt.close / plt.show / plt.savefig protection ────────
 # When agent code does `import matplotlib.pyplot as plt` it replaces the proxy
 # with the real module singleton.  We patch the module-level functions ONCE so
@@ -330,7 +394,18 @@ class PythonSandbox:
                 flush=flush,
             )
 
-        _patched_builtins = {**vars(_builtins_module), "print": _captured_print}
+        # Hardened builtins: this is NOT a true sandbox (real isolation requires
+        # subprocess + seccomp / Docker), but blocking the obviously dangerous
+        # names raises the bar against accidental data-driven RCE through
+        # prompt injection — the agent is still expected to write benign
+        # pandas/numpy/matplotlib code only.
+        _patched_builtins = {
+            k: v for k, v in vars(_builtins_module).items()
+            if k not in _BLOCKED_BUILTINS
+        }
+        _patched_builtins["print"] = _captured_print
+        # Allow `import` only for an explicit allowlist (pandas/numpy/etc.).
+        _patched_builtins["__import__"] = _restricted_import
 
         plots: list[str] = []
 
@@ -397,16 +472,12 @@ class PythonSandbox:
             # ── Truncate stdout to avoid flooding LLM context ──────────────
             # 4 000 chars ≈ 50-80 rows of tabular data — enough to debug,
             # not enough to dump full datasets (those belong in parquet).
-            # head+tail strategy keeps both schema rows and tail rows visible.
+            # Line-aware: cut between rows so a printed DataFrame is readable.
             _MAX_OUTPUT = 4000
             raw_output = stdout_capture.getvalue()
             if len(raw_output) > _MAX_OUTPUT:
-                half = _MAX_OUTPUT // 2
-                raw_output = (
-                    raw_output[:half]
-                    + f"\n… [stdout truncated, showing first+last {half} chars"
-                    f" of {len(raw_output)} total — data in parquet is complete] …\n"
-                    + raw_output[-half:]
+                raw_output = _truncate_on_newlines(
+                    raw_output, _MAX_OUTPUT, label="stdout"
                 )
 
             # ── Auto-fill result from stdout when not explicitly set ───────
@@ -442,13 +513,15 @@ class PythonSandbox:
             # result is shown to the user; keep it readable but bounded.
             # 4K matches the stdout cap — combined with auto-fill dedup below
             # this caps a single tool message at ~4K chars max.
+            #
+            # Truncation is line-aware: a Markdown table sliced mid-row
+            # produces broken pipe characters that the LLM (and the user)
+            # can't render. We snap each cut to the nearest newline so the
+            # head and tail are always whole rows.
             _MAX_RESULT = 4000
             if result_value and len(result_value) > _MAX_RESULT:
-                half_r = _MAX_RESULT // 2
-                result_value = (
-                    result_value[:half_r]
-                    + f"\n… [result truncated: {len(result_value)} chars total] …\n"
-                    + result_value[-half_r:]
+                result_value = _truncate_on_newlines(
+                    result_value, _MAX_RESULT, label="result"
                 )
 
             return {
@@ -470,12 +543,8 @@ class PythonSandbox:
             error_text = full_tb[-2000:] if len(full_tb) > 2000 else full_tb
             raw_output = stdout_capture.getvalue()
             if len(raw_output) > 8000:
-                half = 4000
-                raw_output = (
-                    raw_output[:half]
-                    + f"\n… [stdout truncated, showing first+last {half} chars"
-                    f" of {len(raw_output)} total] …\n"
-                    + raw_output[-half:]
+                raw_output = _truncate_on_newlines(
+                    raw_output, 8000, label="stdout"
                 )
             return {
                 "success": False,

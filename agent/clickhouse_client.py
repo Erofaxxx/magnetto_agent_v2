@@ -5,9 +5,27 @@ Executes SELECT queries and saves results to Parquet.
 
 import hashlib
 import json
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any
+
+
+# Strip --line / /* block */ comments and string literals before checking
+# whether SQL already contains a LIMIT keyword. Without this a comment like
+# `-- KEEP NO LIMIT` would falsely match and skip auto-limit injection.
+_SQL_COMMENT_RE = re.compile(
+    r"--[^\n]*|/\*.*?\*/|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"",
+    re.DOTALL,
+)
+_LIMIT_KEYWORD_RE = re.compile(r"\bLIMIT\b", re.IGNORECASE)
+
+
+def _sql_has_top_level_limit(sql: str) -> bool:
+    """True if `sql` contains a LIMIT keyword outside comments / string literals."""
+    cleaned = _SQL_COMMENT_RE.sub(" ", sql)
+    return bool(_LIMIT_KEYWORD_RE.search(cleaned))
 
 import clickhouse_connect
 import numpy as np
@@ -23,6 +41,22 @@ from config import (
     TEMP_DIR,
     TEMP_FILE_TTL_SECONDS,
 )
+
+
+def _ch_tls_verify_kwargs() -> dict:
+    """
+    Return clickhouse_connect kwargs governing TLS verification.
+
+    Default: verify=True (system trust store).
+    With CLICKHOUSE_SSL_CERT_PATH set: verify=True + custom CA.
+    With CLICKHOUSE_INSECURE=1 set explicitly: verify=False (опасно, но иногда
+    нужно для self-signed dev-серверов; явный opt-in делает риск видимым).
+    """
+    if CLICKHOUSE_SSL_CERT:
+        return {"verify": True, "ca_cert": CLICKHOUSE_SSL_CERT}
+    if os.environ.get("CLICKHOUSE_INSECURE", "0") in ("1", "true", "True", "yes"):
+        return {"verify": False}
+    return {"verify": True}
 
 
 def _safe_json_value(v: Any) -> Any:
@@ -58,11 +92,7 @@ class ClickHouseClient:
             "connect_timeout": 30,
             "send_receive_timeout": 600,
         }
-        if CLICKHOUSE_SSL_CERT:
-            connect_kwargs["verify"] = True
-            connect_kwargs["ca_cert"] = CLICKHOUSE_SSL_CERT
-        else:
-            connect_kwargs["verify"] = False
+        connect_kwargs.update(_ch_tls_verify_kwargs())
 
         self.client = clickhouse_connect.get_client(**connect_kwargs)
         print(
@@ -174,12 +204,16 @@ class ClickHouseClient:
         """
         sql_stripped = sql.strip()
 
-        # Auto-add LIMIT if missing
-        if "LIMIT" not in sql_stripped.upper():
+        # Auto-add LIMIT if missing. Naive `"LIMIT" in upper(sql)` would
+        # falsely match the keyword inside comments or string literals
+        # (e.g. `-- NO LIMIT here`); _sql_has_top_level_limit strips both.
+        if not _sql_has_top_level_limit(sql_stripped):
             sql_stripped = f"{sql_stripped.rstrip().rstrip(';')} LIMIT {limit}"
 
-        # Parquet cache: keyed by SQL hash (no timestamp) so retries reuse the file
-        query_hash = hashlib.md5(sql_stripped.encode()).hexdigest()[:10]
+        # Parquet cache: keyed by SQL hash (no timestamp) so retries reuse the file.
+        # SHA-256 (16 hex chars = 64 bit) — FIPS-safe; collision risk negligible
+        # for any realistic number of unique SQL strings.
+        query_hash = hashlib.sha256(sql_stripped.encode()).hexdigest()[:16]
         parquet_path = str(TEMP_DIR / f"query_{query_hash}.parquet")
         p = Path(parquet_path)
 

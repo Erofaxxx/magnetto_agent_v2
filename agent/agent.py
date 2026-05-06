@@ -34,6 +34,7 @@ Context optimisations (in _build_messages, a per-instance closure):
 """
 
 import json
+import threading
 import time
 import sqlite3
 from copy import copy
@@ -840,11 +841,17 @@ class AnalyticsAgent:
 
 # ─── Per-model singleton cache ────────────────────────────────────────────────
 _agents: dict[str, AnalyticsAgent] = {}
+_agents_lock = threading.Lock()
 
 
 def get_agent(model: Optional[str] = None) -> AnalyticsAgent:
     """Return (or create) a cached AnalyticsAgent instance for the given model."""
     key = model or MODEL
-    if key not in _agents:
-        _agents[key] = AnalyticsAgent(model=key)
+    # Double-checked locking: cheap path skips the lock when the instance
+    # already exists; lock prevents duplicate construction on first parallel hit.
+    if key in _agents:
+        return _agents[key]
+    with _agents_lock:
+        if key not in _agents:
+            _agents[key] = AnalyticsAgent(model=key)
     return _agents[key]

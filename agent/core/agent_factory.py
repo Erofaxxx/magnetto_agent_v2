@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -97,6 +98,7 @@ def _build_model(model_name: str) -> ChatOpenAI:
 # ─── Singleton cache: one agent per (client_id, model) ────────────────────
 
 _AGENT_CACHE: dict[tuple, "object"] = {}
+_AGENT_CACHE_LOCK = threading.Lock()
 
 
 def build_agent(
@@ -266,7 +268,13 @@ def build_agent(
         checkpointer=checkpointer,
     )
 
-    _AGENT_CACHE[cache_key] = agent
+    # Publish under the lock and re-check to avoid two parallel first-time
+    # callers each constructing one agent and overwriting each other in cache.
+    # If another thread won the race, drop our build and return theirs.
+    with _AGENT_CACHE_LOCK:
+        if cache_key in _AGENT_CACHE:
+            return _AGENT_CACHE[cache_key]
+        _AGENT_CACHE[cache_key] = agent
     print(
         f"✅ deepagents main agent ready | client: {client_id} | model: {model_name} | "
         f"subagents: {len(subagent_specs)} | iter_limit: {_MAX_ITERATIONS}"

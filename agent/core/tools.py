@@ -20,7 +20,7 @@ import re
 import shutil
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -102,7 +102,7 @@ def _save_plots_to_session(plots_b64: list[str], *, hint: str = "") -> list[dict
     if not plots_b64:
         return []
     plots_dir = current_plots_dir()
-    date_prefix = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    date_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
     slug = _slugify(hint)
 
     saved = []
@@ -124,7 +124,7 @@ def _save_plots_to_session(plots_b64: list[str], *, hint: str = "") -> list[dict
         ctx = get_current_session()
         if ctx is not None:
             idx_path = ctx.plots_index
-            ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             lines = []
             if not idx_path.exists():
                 lines.append("# Plots Index\n\nСписок графиков, построенных в этой сессии.\n")

@@ -17,6 +17,7 @@ SegmentBuilderAgent — специализированный агент для �
 
 import json
 import sqlite3
+import threading
 from copy import copy
 from typing import Annotated, Optional, TypedDict
 
@@ -576,11 +577,15 @@ class SegmentBuilderAgent:
 
 # ─── Per-model singleton cache ────────────────────────────────────────────────
 _segment_agents: dict[str, SegmentBuilderAgent] = {}
+_segment_agents_lock = threading.Lock()
 
 
 def get_segment_agent(model: Optional[str] = None) -> SegmentBuilderAgent:
     """Return (or create) a cached SegmentBuilderAgent instance for the given model."""
     key = model or MODEL
-    if key not in _segment_agents:
-        _segment_agents[key] = SegmentBuilderAgent(model=key)
+    if key in _segment_agents:
+        return _segment_agents[key]
+    with _segment_agents_lock:
+        if key not in _segment_agents:
+            _segment_agents[key] = SegmentBuilderAgent(model=key)
     return _segment_agents[key]
