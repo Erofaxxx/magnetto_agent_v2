@@ -51,14 +51,15 @@ class SegmentStore:
                     updated_at      TEXT NOT NULL
                 );
             """)
-            # Добавить колонку owner если её нет (миграция существующих данных)
-            try:
+            # Добавить колонку owner если её нет (миграция существующих данных).
+            # Use PRAGMA table_info instead of catching OperationalError blindly,
+            # so a real lock / I/O error is no longer silently swallowed.
+            cols = {row[1] for row in self._conn.execute("PRAGMA table_info(segments)")}
+            if "owner" not in cols:
                 self._conn.execute(
                     "ALTER TABLE segments ADD COLUMN owner TEXT NOT NULL DEFAULT '__shared__'"
                 )
                 self._conn.commit()
-            except sqlite3.OperationalError:
-                pass  # колонка уже существует
 
             # Пересоздать уникальный индекс: (name, owner) вместо просто name
             self._conn.executescript("""

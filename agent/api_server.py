@@ -17,20 +17,54 @@ Architecture change: async job queue.
 """
 import asyncio
 import decimal as _decimal
+import hmac
 import json
 import math as _math
+import re as _re_mod
+import threading as _threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date as _date, datetime, timezone
 _datetime = datetime  # alias for _serialize_value
 from typing import Optional, Literal
 import uvicorn
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 # config.py loads .env exactly once on import; importing it here is enough.
 from config import ALLOWED_MODELS, HOST, MODEL, PORT, SERVER_URL
+
+
+# ─── Session-id validation ────────────────────────────────────────────────────
+# uuid4 strings are alphanumerics + dashes; we accept the same shape generically
+# so legacy ids still work but reject anything path-traversal-shaped before
+# concatenating into a filesystem path.
+_SESSION_ID_RE = _re_mod.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def _validate_session_id(session_id: str) -> str:
+    if not _SESSION_ID_RE.match(session_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+    return session_id
+
+
+# ─── Debug-endpoint authorization ─────────────────────────────────────────────
+# Per-deployment opt-in: set DEBUG_TOKEN in env to enable /debug/* endpoints.
+# Without the env var the endpoints respond 404 (effectively disabled),
+# which matches the principle of least exposure for prod.
+_DEBUG_TOKEN_ENV_NAME = "DEBUG_TOKEN"
+
+
+def _require_debug_auth(x_debug_token: Optional[str] = Header(default=None, alias="X-Debug-Token")) -> None:
+    """FastAPI dependency: gates /debug/* behind a constant-time-compared token."""
+    import os as _os_local
+    expected = (_os_local.environ.get(_DEBUG_TOKEN_ENV_NAME) or "").strip()
+    if not expected:
+        # Disabled in this deployment — pretend the route doesn't exist.
+        raise HTTPException(status_code=404, detail="Not Found")
+    if not x_debug_token or not hmac.compare_digest(expected, x_debug_token):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 # ─── deepagents switch ────────────────────────────────────────────────────
 # When USE_DEEPAGENTS=1, requests are routed through core.api_adapter
@@ -99,38 +133,69 @@ app.add_middleware(
 # ─── Job store ────────────────────────────────────────────────────────────────
 # job_id → JobRecord dict
 # Хранится в памяти; при рестарте сервера задачи теряются (это приемлемо).
+# WARNING: this implies a single-worker uvicorn deployment — multiple workers
+# will each have their own dict, so a job_id created on worker A is invisible
+# on worker B. Keep `--workers 1`, or move the store to Redis/SQLite later.
 JOB_TTL_SECONDS = 7200  # 2 часа
+JOB_TIMEOUT_SECONDS = int(_os.environ.get("JOB_TIMEOUT_SECONDS", "900"))  # 15 min default
+MAX_QUERY_LENGTH = int(_os.environ.get("MAX_QUERY_LENGTH", "32000"))
 JobStatus = Literal["pending", "running", "done", "error"]
 _jobs: dict[str, dict] = {}
+_jobs_lock = _threading.Lock()
+
+
 def _new_job(session_id: str, query: str, model: Optional[str] = None) -> str:
     job_id = str(uuid.uuid4())
-    _jobs[job_id] = {
-        "job_id": job_id,
-        "session_id": session_id,
-        "query": query,
-        "model": model,   # None → default model
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "started_at": None,
-        "finished_at": None,
-        "result": None,   # AnalyzeResponse dict when done
-        "error": None,
-    }
+    with _jobs_lock:
+        _jobs[job_id] = {
+            "job_id": job_id,
+            "session_id": session_id,
+            "query": query,
+            "model": model,   # None → default model
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": None,
+            "finished_at": None,
+            "result": None,   # AnalyzeResponse dict when done
+            "error": None,
+        }
     return job_id
+
+
 def _set_running(job_id: str) -> None:
-    _jobs[job_id]["status"] = "running"
-    _jobs[job_id]["started_at"] = datetime.now(timezone.utc).isoformat()
+    # No-op when the job has already been pruned by cleanup_loop — avoids
+    # KeyError racing against TTL eviction.
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job["status"] = "running"
+        job["started_at"] = datetime.now(timezone.utc).isoformat()
+
+
 def _set_done(job_id: str, result: dict) -> None:
-    _jobs[job_id]["status"] = "done"
-    _jobs[job_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
-    _jobs[job_id]["result"] = result
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job["status"] = "done"
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        job["result"] = result
+
+
 def _set_error(job_id: str, error: str) -> None:
-    _jobs[job_id]["status"] = "error"
-    _jobs[job_id]["finished_at"] = datetime.now(timezone.utc).isoformat()
-    _jobs[job_id]["error"] = error
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            return
+        job["status"] = "error"
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        job["error"] = error
 # ─── Request / Response models ────────────────────────────────────────────────
 class AnalyzeRequest(BaseModel):
-    query: str
+    # Length is bounded so a malicious or buggy client can't push a 10 MB
+    # query into the LLM context (and into Anthropic prompt cache).
+    query: str = Field(min_length=1, max_length=MAX_QUERY_LENGTH)
     session_id: Optional[str] = None
     model: Optional[str] = None  # None → default model from config
 class SubmitResponse(BaseModel):
@@ -157,8 +222,14 @@ class JobStatusResponse(BaseModel):
     error: Optional[str] = None
 # ─── Background worker ────────────────────────────────────────────────────────
 async def _run_agent_job(job_id: str) -> None:
-    """Run the agent in a thread pool and store the result in _jobs."""
-    job = _jobs.get(job_id)
+    """Run the agent in a thread pool and store the result in _jobs.
+
+    A hard timeout (JOB_TIMEOUT_SECONDS) guarantees a single hung LLM/CH
+    call cannot occupy a thread-pool slot indefinitely; on timeout we
+    set status="error" so the client sees a definitive failure.
+    """
+    with _jobs_lock:
+        job = _jobs.get(job_id)
     if not job:
         return
     _set_running(job_id)
@@ -166,19 +237,25 @@ async def _run_agent_job(job_id: str) -> None:
     try:
         if _USE_DEEPAGENTS:
             from core.api_adapter import analyze_deepagents
-            result = await asyncio.to_thread(
-                analyze_deepagents,
-                query=job["query"],
-                session_id=job["session_id"],
-                model=job.get("model"),
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    analyze_deepagents,
+                    query=job["query"],
+                    session_id=job["session_id"],
+                    model=job.get("model"),
+                ),
+                timeout=JOB_TIMEOUT_SECONDS,
             )
         else:
             from agent import get_agent
             agent = get_agent(job.get("model"))
-            result = await asyncio.to_thread(
-                agent.analyze,
-                user_query=job["query"],
-                session_id=job["session_id"],
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    agent.analyze,
+                    user_query=job["query"],
+                    session_id=job["session_id"],
+                ),
+                timeout=JOB_TIMEOUT_SECONDS,
             )
         _set_done(job_id, result)
 
@@ -212,9 +289,48 @@ async def _run_agent_job(job_id: str) -> None:
         except Exception as log_exc:
             print(f"[ChatLogger] init error (non-fatal): {log_exc}")
 
+    except asyncio.TimeoutError:
+        _set_error(job_id, f"Job exceeded {JOB_TIMEOUT_SECONDS}s timeout")
+        print(f"[job:{job_id}] TIMEOUT after {JOB_TIMEOUT_SECONDS}s")
     except Exception as exc:
         _set_error(job_id, str(exc))
         print(f"[job:{job_id}] ERROR: {exc}")
+# ─── Session-files cleanup (deepagents) ──────────────────────────────────────
+def _cleanup_session_files() -> int:
+    """
+    Remove parquet/plot files in sessions/<id>/ older than TEMP_FILE_TTL_SECONDS.
+    The legacy `cleanup_temp_files` only walks the flat TEMP_DIR; deepagents
+    writes per-session files under TEMP_DIR/sessions/<sid>/{parquet,plots}/,
+    which were leaking until expiry pruning was added here.
+
+    Returns the number of files removed.
+    """
+    import time
+    from config import TEMP_DIR, TEMP_FILE_TTL_SECONDS
+    sessions_root = TEMP_DIR / "sessions"
+    if not sessions_root.exists():
+        return 0
+    cutoff = time.time() - TEMP_FILE_TTL_SECONDS
+    removed = 0
+    for sid_dir in sessions_root.iterdir():
+        if not sid_dir.is_dir():
+            continue
+        for sub in ("parquet", "plots"):
+            d = sid_dir / sub
+            if not d.exists():
+                continue
+            for f in d.iterdir():
+                if not f.is_file():
+                    continue
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink(missing_ok=True)
+                        removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 # ─── Cleanup loop ─────────────────────────────────────────────────────────────
 async def _cleanup_loop() -> None:
     """Remove expired jobs and parquet files every 30 minutes.
@@ -227,18 +343,22 @@ async def _cleanup_loop() -> None:
         try:
             await asyncio.sleep(1800)
             now = datetime.now(timezone.utc).timestamp()
-            # Clean expired jobs
-            expired = [
-                jid for jid, j in list(_jobs.items())
-                if j["status"] in ("done", "error")
-                and j["finished_at"]
-                and (now - datetime.fromisoformat(j["finished_at"]).timestamp()) > JOB_TTL_SECONDS
-            ]
-            for jid in expired:
-                del _jobs[jid]
+            # Clean expired jobs (snapshot under lock so we don't iterate
+            # a dict that another coroutine is mutating).
+            with _jobs_lock:
+                expired = [
+                    jid for jid, j in _jobs.items()
+                    if j["status"] in ("done", "error")
+                    and j["finished_at"]
+                    and (now - datetime.fromisoformat(j["finished_at"]).timestamp()) > JOB_TTL_SECONDS
+                ]
+                for jid in expired:
+                    _jobs.pop(jid, None)
             if expired:
                 print(f"[cleanup] Removed {len(expired)} expired job(s)")
-            # Clean parquet files
+            # Clean parquet files (legacy TEMP_DIR/*.parquet). Note this
+            # cleanup does NOT cover deepagents per-session directories;
+            # those are handled by _cleanup_session_files below.
             try:
                 from agent import get_agent
                 n = await asyncio.to_thread(get_agent().cleanup_temp_files)
@@ -246,6 +366,14 @@ async def _cleanup_loop() -> None:
                     print(f"[cleanup] Removed {n} expired parquet file(s)")
             except Exception as exc:
                 print(f"[cleanup] Parquet cleanup error: {exc}")
+            # Clean per-session deepagents files (sessions/<id>/parquet|plots).
+            if _USE_DEEPAGENTS:
+                try:
+                    n = await asyncio.to_thread(_cleanup_session_files)
+                    if n:
+                        print(f"[cleanup] Removed {n} expired session file(s)")
+                except Exception as exc:
+                    print(f"[cleanup] Session cleanup error: {exc}")
         except asyncio.CancelledError:
             # Propagate cancellation so lifespan can await us cleanly.
             raise
@@ -269,6 +397,7 @@ async def get_session_file(session_id: str, path: str):
     from fastapi.responses import FileResponse
     if not _USE_DEEPAGENTS:
         raise HTTPException(status_code=400, detail="Files endpoint only available with USE_DEEPAGENTS=1")
+    _validate_session_id(session_id)
     if not path.startswith(("/plots/", "/parquet/", "/memories/")):
         raise HTTPException(status_code=400, detail="Path must start with /plots/, /parquet/, or /memories/")
     import re
@@ -277,9 +406,16 @@ async def get_session_file(session_id: str, path: str):
 
     from config import TEMP_DIR
     import pathlib
-    # Strip leading slash and prepend session root
+    # Strip leading slash and prepend session root.  Resolve symlinks and assert
+    # the result still sits under TEMP_DIR/sessions/<id>/ — defence in depth on
+    # top of the prefix/dot-segment checks above.
     rel = path.lstrip("/")
-    full = pathlib.Path(TEMP_DIR) / "sessions" / session_id / rel
+    session_root = (pathlib.Path(TEMP_DIR) / "sessions" / session_id).resolve()
+    full = (session_root / rel).resolve()
+    try:
+        full.relative_to(session_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path")
     if not full.exists() or not full.is_file():
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
     return FileResponse(str(full))
@@ -305,6 +441,7 @@ async def get_session_parquet(
     """
     if not _USE_DEEPAGENTS:
         raise HTTPException(status_code=400, detail="Parquet endpoint only available with USE_DEEPAGENTS=1")
+    _validate_session_id(session_id)
     if not path.startswith("/parquet/"):
         raise HTTPException(status_code=400, detail="Path must start with /parquet/")
     import re as _re
@@ -320,7 +457,12 @@ async def get_session_parquet(
     from config import TEMP_DIR
     import pathlib
     rel = path.lstrip("/")
-    full = pathlib.Path(TEMP_DIR) / "sessions" / session_id / rel
+    session_root = (pathlib.Path(TEMP_DIR) / "sessions" / session_id).resolve()
+    full = (session_root / rel).resolve()
+    try:
+        full.relative_to(session_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid path")
     if not full.exists() or not full.is_file():
         raise HTTPException(status_code=404, detail=f"Parquet not found: {path}")
 
@@ -359,6 +501,7 @@ async def list_session_files(session_id: str):
     """List all files (plots + parquet + memories) created in this session."""
     if not _USE_DEEPAGENTS:
         raise HTTPException(status_code=400, detail="Files endpoint only available with USE_DEEPAGENTS=1")
+    _validate_session_id(session_id)
     from config import TEMP_DIR
     import pathlib
     session_root = pathlib.Path(TEMP_DIR) / "sessions" / session_id
@@ -477,6 +620,10 @@ async def get_job(job_id: str):
         resp.success = r.get("success", True)
         resp.text_output = r.get("text_output", "")
         resp.plots = r.get("plots", [])
+        # Forward virtual-fs metadata produced by the deepagents pipeline so
+        # the frontend can deep-link without a separate /files request.
+        resp.plot_urls = r.get("plot_urls", [])
+        resp.parquet_paths = r.get("parquet_paths", [])
         resp.tool_calls = r.get("tool_calls", [])
         resp.error = r.get("error")
     return resp
@@ -492,7 +639,8 @@ async def chat_stats():
 # These endpoints are for developer use only (agent optimization analysis).
 # They are NOT intended for the end-user frontend.
 
-@app.get("/debug/sessions", tags=["debug"], summary="List all logged sessions")
+@app.get("/debug/sessions", tags=["debug"], summary="List all logged sessions",
+         dependencies=[Depends(_require_debug_auth)])
 async def debug_sessions():
     """
     List all sessions with aggregated stats:
@@ -506,8 +654,10 @@ async def debug_sessions():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/debug/session/{session_id}", tags=["debug"], summary="Full session log with tool calls")
+@app.get("/debug/session/{session_id}", tags=["debug"], summary="Full session log with tool calls",
+         dependencies=[Depends(_require_debug_auth)])
 async def debug_session_logs(session_id: str):
+    _validate_session_id(session_id)
     """
     Full chronological log of a session grouped by turn.
 
@@ -552,8 +702,10 @@ async def debug_session_logs(session_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/debug/session/{session_id}/turn/{turn_index}", tags=["debug"], summary="Log for one specific turn")
+@app.get("/debug/session/{session_id}/turn/{turn_index}", tags=["debug"], summary="Log for one specific turn",
+         dependencies=[Depends(_require_debug_auth)])
 async def debug_turn_logs(session_id: str, turn_index: int):
+    _validate_session_id(session_id)
     """
     Detailed event log for a single turn within a session.
     Useful for deep-diving into one specific question the user asked.
@@ -581,7 +733,8 @@ async def debug_turn_logs(session_id: str, turn_index: int):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/debug/stats", tags=["debug"], summary="Aggregate optimization stats")
+@app.get("/debug/stats", tags=["debug"], summary="Aggregate optimization stats",
+         dependencies=[Depends(_require_debug_auth)])
 async def debug_stats():
     """
     Aggregate statistics across all logged sessions.
@@ -645,8 +798,7 @@ async def segment_chat(
     owner = x_user_id or _SHARED_OWNER
     session_id = req.session_id or str(uuid.uuid4())
     agent = get_segment_agent(req.model)
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, agent.chat, req.message, session_id, owner)
+    result = await asyncio.to_thread(agent.chat, req.message, session_id, owner)
     return SegmentChatResponse(
         success=result["success"],
         session_id=session_id,
@@ -665,8 +817,7 @@ async def get_segment_chat_history(session_id: str):
     """История диалога сессии сегментации в формате [{role, content}]."""
     from segment_agent import get_segment_agent
     agent = get_segment_agent()
-    loop = asyncio.get_event_loop()
-    history = await loop.run_in_executor(None, agent.get_session_history, session_id)
+    history = await asyncio.to_thread(agent.get_session_history, session_id)
     return {"session_id": session_id, "history": history}
 
 
@@ -682,8 +833,7 @@ async def list_segments(
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     store = get_segment_store()
-    loop = asyncio.get_event_loop()
-    segments = await loop.run_in_executor(None, store.list_all, owner)
+    segments = await asyncio.to_thread(store.list_all, owner)
     return {"segments": segments}
 
 
@@ -700,8 +850,7 @@ async def get_segment(
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     store = get_segment_store()
-    loop = asyncio.get_event_loop()
-    seg = await loop.run_in_executor(None, store.get_by_id, segment_id, owner)
+    seg = await asyncio.to_thread(store.get_by_id, segment_id, owner)
     if not seg:
         raise HTTPException(status_code=404, detail="Segment not found")
     return seg
@@ -720,8 +869,7 @@ async def delete_segment(
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     store = get_segment_store()
-    loop = asyncio.get_event_loop()
-    deleted = await loop.run_in_executor(None, store.delete, segment_id, owner)
+    deleted = await asyncio.to_thread(store.delete, segment_id, owner)
     if not deleted:
         raise HTTPException(status_code=404, detail="Segment not found")
     return {"success": True}
@@ -764,8 +912,10 @@ _ALLOWED_ZONE_STATUSES = {"red", "green", "yellow"}
 # Адаптивный список кабинетов: вычитывается из ClickHouse (SELECT DISTINCT cabinet_name)
 # и кэшируется на _CABINET_CACHE_TTL секунд. При истечении TTL (или в случае ошибки
 # дискавери при пустом кэше) бэк пытается перечитать; пока cache непустой — отдаёт его.
+# `last_error_at` is set when a refresh fails so /api/tables can advertise
+# whether the list is stale — frontend then knows to warn the user.
 _CABINET_CACHE_TTL = 3600  # 1 час
-_cabinet_cache: dict = {"values": [], "fetched_at": 0.0}
+_cabinet_cache: dict = {"values": [], "fetched_at": 0.0, "last_error_at": 0.0}
 
 
 async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
@@ -798,13 +948,20 @@ async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
             cabinets = [str(v) for v in df["cabinet_name"].dropna().tolist()]
             _cabinet_cache["values"] = cabinets
             _cabinet_cache["fetched_at"] = now
+            _cabinet_cache["last_error_at"] = 0.0
             return cabinets
-    except Exception:
+    except Exception as exc:
         # Сеть/ClickHouse упал — отдаём последние известные значения,
         # даже если TTL истёк. Пустой список означает "ещё не грузили".
-        pass
+        _cabinet_cache["last_error_at"] = now
+        print(f"[cabinets] refresh failed (cache stale): {exc}")
 
     return _cabinet_cache["values"]
+
+
+def _cabinets_are_stale() -> bool:
+    """True if the last cabinet refresh failed more recently than the last success."""
+    return _cabinet_cache["last_error_at"] > _cabinet_cache["fetched_at"]
 
 
 @app.get("/api/tables", tags=["tables"], summary="Список доступных именованных запросов")
@@ -827,6 +984,7 @@ async def list_table_queries():
             for name, q in QUERIES.items()
         ],
         "cabinets": cabinets,  # общий список (одинаков для всех filterable_cabinet таблиц)
+        "cabinets_stale": _cabinets_are_stale(),
     }
 
 
@@ -904,9 +1062,10 @@ async def get_table_data(
     try:
         from tools import _ch_lock, _get_ch_client
         ch = _get_ch_client()
+        # Hold the lock across both queries so another caller can't slip in
+        # between and stale the count vs the page we just fetched.
         with _ch_lock:
             result = await asyncio.to_thread(ch.execute_query, sql)
-        with _ch_lock:
             count_result = await asyncio.to_thread(ch.execute_query, count_sql)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

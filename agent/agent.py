@@ -231,8 +231,11 @@ class AnalyticsAgent:
         self.llm = _create_llm(model, provider)
 
         # ── SqliteSaver checkpointer ──────────────────────────────────────
+        # WAL lets reads/writes from chat_logger/segment_store cohabit the
+        # same DB without bouncing on SQLITE_BUSY.
         conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         conn.execute("PRAGMA busy_timeout = 5000")  # wait up to 5s on lock
+        conn.execute("PRAGMA journal_mode = WAL")
         self.memory = SqliteSaver(conn)
 
         # ── Fetch schema once at startup ──────────────────────────────────

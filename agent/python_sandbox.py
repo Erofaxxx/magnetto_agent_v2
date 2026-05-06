@@ -8,6 +8,7 @@ user-provided code in a controlled namespace. Captures:
   - `result` variable → final text/table output
 """
 
+import ast
 import base64
 import builtins as _builtins_module
 import io
@@ -86,6 +87,51 @@ def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
         f"Import of '{name}' is not permitted in the sandbox. "
         f"Allowed: {sorted(_ALLOWED_IMPORTS)}"
     )
+
+
+# ─── Static check: reject obvious sandbox-bypass patterns before exec ────────
+# A real sandbox would isolate the interpreter; here we add a cheap AST scan
+# that refuses code referencing the dunders most often used to walk the
+# object graph back to subprocess/os: `__class__`, `__mro__`, `__subclasses__`,
+# `__bases__`, `__globals__`, `__import__`, `__builtins__`. This is not
+# bullet-proof (e.g. `getattr(x, "__c" + "lass__")` is still possible), but
+# it forces an attacker to write obviously-malicious code instead of a
+# casual `().__class__.__mro__[1].__subclasses__()` one-liner.
+_BLOCKED_DUNDERS: frozenset[str] = frozenset({
+    "__class__", "__mro__", "__subclasses__", "__bases__", "__globals__",
+    "__import__", "__builtins__", "__getattribute__", "__loader__", "__spec__",
+})
+_BLOCKED_NAMES_AST: frozenset[str] = frozenset({
+    "eval", "exec", "compile", "open", "input", "breakpoint",
+    "__import__", "globals", "vars",
+})
+
+
+def _validate_sandbox_code(code: str) -> None:
+    """Raise SyntaxError or ValueError if `code` references blocked names/attrs."""
+    tree = ast.parse(code)  # SyntaxError propagates with the original message
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _BLOCKED_DUNDERS:
+            raise ValueError(
+                f"Sandbox: access to attribute '{node.attr}' is not permitted "
+                f"(line {getattr(node, 'lineno', '?')})"
+            )
+        if isinstance(node, ast.Name) and node.id in _BLOCKED_NAMES_AST:
+            raise ValueError(
+                f"Sandbox: use of builtin '{node.id}' is not permitted "
+                f"(line {getattr(node, 'lineno', '?')})"
+            )
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = node.module if isinstance(node, ast.ImportFrom) else None
+            for alias in node.names:
+                target = module or alias.name
+                root = target.split(".", 1)[0]
+                if root not in _ALLOWED_IMPORTS and target not in _ALLOWED_IMPORTS:
+                    raise ValueError(
+                        f"Sandbox: import of '{target}' is not permitted "
+                        f"(line {getattr(node, 'lineno', '?')}). "
+                        f"Allowed roots: {sorted(_ALLOWED_IMPORTS)}"
+                    )
 
 
 def _truncate_on_newlines(text: str, max_len: int, *, label: str = "output") -> str:
@@ -213,16 +259,21 @@ def _coerce_df(df: pd.DataFrame) -> pd.DataFrame:
     # equality checks (orders == 47 fails for 47.0).
     for col in list(df.select_dtypes("float64").columns):
         s = df[col].dropna()
-        if len(s) > 0 and (s == s.astype("int64")).all():
-            df[col] = df[col].astype("Int64")
+        if len(s) == 0:
+            continue
+        # astype("int64") on values >= 2**63 raises OverflowError; we silently
+        # skip the conversion for those columns instead of letting a single
+        # huge revenue value crash the whole dataframe coercion.
+        try:
+            if (s == s.astype("int64")).all():
+                df[col] = df[col].astype("Int64")
+        except (OverflowError, ValueError):
+            continue
     return df
 
 
 def _safe_read_parquet(path, *args, **kwargs):
     return _coerce_df(_orig_pd_read_parquet(path, *args, **kwargs))
-
-
-pd.read_parquet = _safe_read_parquet
 
 
 # ─── Virtual `/parquet/<file>` write support ──────────────────────────────────
@@ -249,7 +300,12 @@ def _virtual_to_parquet(self, path=None, *args, **kwargs):
     return _orig_pd_to_parquet(self, path, *args, **kwargs)
 
 
-pd.DataFrame.to_parquet = _virtual_to_parquet
+# NOTE: pd.read_parquet / pd.DataFrame.to_parquet are *NOT* monkey-patched at
+# import time. Doing so leaks sandbox semantics (type coercion, virtual /parquet/
+# resolution) into every other consumer of pandas in the same process —
+# including FastAPI endpoints that read parquet files for the chat UI.
+# Patching is now scoped to PythonSandbox.execute() via try/finally, so the
+# behaviour is visible only to agent code running inside the sandbox.
 
 
 class _PlotProxy:
@@ -286,12 +342,17 @@ _PYTHON_LEAK_RE = re.compile(
 # Only flag if the suspicious text sits inside a table cell or inline value
 # (i.e., not inside a fenced code block where Python IS expected).
 _CODE_FENCE_RE = re.compile(r"```[\s\S]*?```")
+# Also strip markdown inline code (`...`) and bold/italic emphasis around
+# code-like fragments — when the LLM EXPLAINS its own code (`if not np.isnan(x)`),
+# that's intentional and shouldn't be flagged as a leaked expression.
+_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 
 
 def _has_python_leak(text: str) -> bool:
     """Return True if result text appears to contain leaked Python expressions."""
-    # Strip fenced code blocks — Python there is intentional
+    # Strip fenced/inline code blocks — Python there is intentional
     stripped = _CODE_FENCE_RE.sub("", text)
+    stripped = _INLINE_CODE_RE.sub("", stripped)
     return bool(_PYTHON_LEAK_RE.search(stripped))
 
 
@@ -319,6 +380,22 @@ class PythonSandbox:
             "error": str | None,
           }
         """
+        # ── Static safety check on the source code ─────────────────────────
+        # Refuses obvious sandbox-bypass shapes (`__class__`, `__mro__`,
+        # `__subclasses__`, raw `eval`/`exec`, disallowed imports) BEFORE we
+        # spend any time loading parquet or compiling. Returns a plain error
+        # to the LLM so it can rewrite the code in the same context.
+        try:
+            _validate_sandbox_code(code)
+        except (SyntaxError, ValueError) as exc:
+            return {
+                "success": False,
+                "output": "",
+                "result": None,
+                "plots": [],
+                "error": f"Sandbox rejected the code: {exc}",
+            }
+
         # ── Load data from Parquet (with coercions applied by _safe_read_parquet) ─
         try:
             df = _orig_pd_read_parquet(parquet_path)  # load raw first for error handling
@@ -356,14 +433,15 @@ class PythonSandbox:
             if len(df[col].dropna()) > 0 and isinstance(df[col].dropna().iloc[0], list)
         ]
 
-        # ── Snapshot existing figure numbers before exec ───────────────────
+        # ── Snapshot existing figure numbers + global pandas state ─────────
         # matplotlib is a global singleton shared across all parallel calls.
         # We record which figures exist BEFORE our exec, then after exec we
         # capture and close only the NEW figures created by THIS call.
         # _figure_lock makes the snapshot atomic so parallel calls don't
-        # interleave their before/after reads.
-        _saved_rc = dict(plt.rcParams)  # snapshot to restore after exec
+        # interleave their before/after reads or restore each other's
+        # rcParams snapshots mid-exec.
         with _figure_lock:
+            _saved_rc = dict(plt.rcParams)  # snapshot to restore after exec
             _before_fignums: set[int] = set(plt.get_fignums())
 
         # ── Prepare execution namespace ────────────────────────────────────
@@ -444,6 +522,17 @@ class PythonSandbox:
         pd.set_option("display.max_rows", 100)
         pd.set_option("display.max_columns", 30)
         pd.set_option("display.width", 200)
+
+        # ── Scope pandas monkey-patches to this exec only ──────────────────
+        # _safe_read_parquet wraps reads with `_coerce_df`; _virtual_to_parquet
+        # remaps `/parquet/<file>` writes onto the current session dir. These
+        # are sandbox-only behaviours and must NOT leak to FastAPI endpoints
+        # that also use pandas in the same process. We patch at the start of
+        # exec and restore in finally.
+        _saved_read_parquet = pd.read_parquet
+        _saved_to_parquet = pd.DataFrame.to_parquet
+        pd.read_parquet = _safe_read_parquet
+        pd.DataFrame.to_parquet = _virtual_to_parquet
 
         try:
             # ── Execute code ────────────────────────────────────────────────
@@ -557,6 +646,10 @@ class PythonSandbox:
         finally:
             # Disable guard first so that plt.close() below is the real one.
             _tls.exec_active = False
+            # Restore pandas read/write functions — must happen even if
+            # exec() raised so other parts of the process see vanilla pandas.
+            pd.read_parquet = _saved_read_parquet
+            pd.DataFrame.to_parquet = _saved_to_parquet
             # Restore rcParams to pre-exec state so agent code cannot
             # permanently change styles for subsequent calls.
             plt.rcParams.update(_saved_rc)

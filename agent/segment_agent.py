@@ -314,7 +314,12 @@ class SegmentBuilderAgent:
         self.llm = ChatOpenAI(**kwargs)
 
         # ── SqliteSaver (тот же DB_PATH, отдельный connection) ────────────
+        # busy_timeout aligns with agent.py / core.agent_factory; without it
+        # concurrent writers from this connection and SqliteSaver-owned ones
+        # immediately raise `database is locked` instead of waiting.
         conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout = 5000")
+        conn.execute("PRAGMA journal_mode = WAL")
         self.memory = SqliteSaver(conn)
 
         # ── Динамическая загрузка схемы ───────────────────────────────────

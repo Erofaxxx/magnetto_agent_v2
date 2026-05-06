@@ -216,8 +216,12 @@ def build_agent(
         ] + existing_mw
 
     # ── Checkpointer (per-process single conn) ──────────────────────────
+    # WAL mode lets readers proceed concurrently with writers — without it
+    # parallel deepagents tasks writing checkpoints from different async
+    # tasks would serialise and trigger SQLITE_BUSY under load.
     conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
     checkpointer = SqliteSaver(conn)
 
     # ── Assemble deep agent ──────────────────────────────────────────────
