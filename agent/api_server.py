@@ -49,6 +49,31 @@ def _validate_session_id(session_id: str) -> str:
     return session_id
 
 
+_X_USER_ID_RE = _re_mod.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
+
+
+def _validate_x_user_id(x_user_id: Optional[str]) -> Optional[str]:
+    """Reject malformed X-User-Id values BEFORE they hit segment_store SQLite.
+
+    None is allowed (anonymous user falls back to _SHARED_OWNER); any non-empty
+    value must match the regex above so a hostile client can't push a 1MB header
+    or path-traversal-shaped id into the owner column / cache keys.
+    """
+    if x_user_id is None:
+        return None
+    if not _X_USER_ID_RE.match(x_user_id):
+        raise HTTPException(status_code=400, detail="Invalid X-User-Id")
+    return x_user_id
+
+
+# ─── Strong-ref set for fire-and-forget tasks ────────────────────────────────
+# asyncio.create_task only keeps a weak reference to the task; without an
+# external strong ref the loop may garbage-collect a still-running task
+# (see https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
+# We add each job task here and self-remove on completion.
+_running_tasks: set[asyncio.Task] = set()
+
+
 # ─── Debug-endpoint authorization ─────────────────────────────────────────────
 # Per-deployment opt-in: set DEBUG_TOKEN in env to enable /debug/* endpoints.
 # Without the env var the endpoints respond 404 (effectively disabled),
@@ -123,12 +148,21 @@ if _cors_origins_env:
 else:
     _cors_origins = ["*"]
     _cors_credentials = False
+# Explicit headers list keeps spec-compliant behaviour when credentials=True
+# (some browsers reject `*` headers in that mode and Starlette would silently
+# narrow it anyway). These are the only request headers we actually consume.
+_CORS_HEADERS = [
+    "Content-Type",
+    "Authorization",
+    "X-User-Id",
+    "X-Debug-Token",
+]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
     allow_credentials=_cors_credentials,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=_CORS_HEADERS,
 )
 # ─── Job store ────────────────────────────────────────────────────────────────
 # job_id → JobRecord dict
@@ -298,10 +332,11 @@ async def _run_agent_job(job_id: str) -> None:
 # ─── Session-files cleanup (deepagents) ──────────────────────────────────────
 def _cleanup_session_files() -> int:
     """
-    Remove parquet/plot files in sessions/<id>/ older than TEMP_FILE_TTL_SECONDS.
-    The legacy `cleanup_temp_files` only walks the flat TEMP_DIR; deepagents
-    writes per-session files under TEMP_DIR/sessions/<sid>/{parquet,plots}/,
-    which were leaking until expiry pruning was added here.
+    Remove parquet/plot files in sessions/<id>/ older than TEMP_FILE_TTL_SECONDS,
+    then rmdir() any sub-directory and the session dir itself if it became empty.
+    Without the rmdir step empty directories accumulate per-session over the
+    server's lifetime, slowly eating inodes and making `iterdir()` linearly
+    slower across cleanup cycles.
 
     Returns the number of files removed.
     """
@@ -328,6 +363,16 @@ def _cleanup_session_files() -> int:
                         removed += 1
                 except OSError:
                     pass
+            # Drop the sub-dir if it is now empty (rmdir fails for non-empty).
+            try:
+                d.rmdir()
+            except OSError:
+                pass
+        # Drop the session dir itself if everything inside expired.
+        try:
+            sid_dir.rmdir()
+        except OSError:
+            pass
     return removed
 
 
@@ -356,16 +401,19 @@ async def _cleanup_loop() -> None:
                     _jobs.pop(jid, None)
             if expired:
                 print(f"[cleanup] Removed {len(expired)} expired job(s)")
-            # Clean parquet files (legacy TEMP_DIR/*.parquet). Note this
-            # cleanup does NOT cover deepagents per-session directories;
-            # those are handled by _cleanup_session_files below.
-            try:
-                from agent import get_agent
-                n = await asyncio.to_thread(get_agent().cleanup_temp_files)
-                if n:
-                    print(f"[cleanup] Removed {n} expired parquet file(s)")
-            except Exception as exc:
-                print(f"[cleanup] Parquet cleanup error: {exc}")
+            # Clean legacy TEMP_DIR/*.parquet — only relevant when we actually
+            # run on the legacy AnalyticsAgent. In deepagents mode all parquet
+            # writes go through sessions/<id>/parquet/, so dragging the whole
+            # legacy agent (LLM client, schema cache, SqliteSaver) into memory
+            # just to glob a directory was wasteful.
+            if not _USE_DEEPAGENTS:
+                try:
+                    from agent import get_agent
+                    n = await asyncio.to_thread(get_agent().cleanup_temp_files)
+                    if n:
+                        print(f"[cleanup] Removed {n} expired parquet file(s)")
+                except Exception as exc:
+                    print(f"[cleanup] Parquet cleanup error: {exc}")
             # Clean per-session deepagents files (sessions/<id>/parquet|plots).
             if _USE_DEEPAGENTS:
                 try:
@@ -564,8 +612,14 @@ async def new_session():
     }
 @app.get("/api/session/{session_id}", summary="Get session metadata")
 async def get_session(session_id: str):
-    # Count pending/running jobs for this session
-    active = [j for j in _jobs.values() if j["session_id"] == session_id and j["status"] in ("pending", "running")]
+    _validate_session_id(session_id)
+    # Snapshot under the lock so cleanup_loop's pop() can't trigger
+    # `dictionary changed size during iteration` while we filter.
+    with _jobs_lock:
+        active = [
+            j for j in _jobs.values()
+            if j["session_id"] == session_id and j["status"] in ("pending", "running")
+        ]
     return {
         "session_id": session_id,
         "active_jobs": len(active),
@@ -585,10 +639,20 @@ async def analyze(req: AnalyzeRequest):
             status_code=400,
             detail=f"Unknown model '{req.model}'. Allowed: {list(ALLOWED_MODELS.keys())}",
         )
+    # Validate the client-supplied session_id BEFORE it reaches
+    # make_session_context() (which calls mkdir(parents=True) on the path
+    # `TEMP_DIR/sessions/<session_id>`). Without this, a `..`/path-traversal
+    # id would create directories outside TEMP_DIR.
+    if req.session_id:
+        _validate_session_id(req.session_id)
     session_id = req.session_id or str(uuid.uuid4())
     job_id = _new_job(session_id=session_id, query=req.query, model=req.model)
-    # Fire and forget
-    asyncio.create_task(_run_agent_job(job_id))
+    # Fire and forget — keep a strong reference so the event loop doesn't
+    # garbage-collect the task mid-flight (bare create_task only stores a
+    # weak ref, see https://docs.python.org/3/library/asyncio-task.html).
+    task = asyncio.create_task(_run_agent_job(job_id))
+    _running_tasks.add(task)
+    task.add_done_callback(_running_tasks.discard)
     return SubmitResponse(
         job_id=job_id,
         session_id=session_id,
@@ -603,7 +667,8 @@ async def get_job(job_id: str):
     status: "pending" | "running" | "done" | "error"
     When status == "done", text_output, plots, tool_calls are populated.
     """
-    job = _jobs.get(job_id)
+    with _jobs_lock:
+        job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found (may have expired)")
     resp = JobStatusResponse(
@@ -630,11 +695,13 @@ async def get_job(job_id: str):
 # ─── Stats ────────────────────────────────────────────────────────────────────
 @app.get("/api/chat-stats", summary="Database statistics")
 async def chat_stats():
-    total = len(_jobs)
-    by_status = {}
-    for j in _jobs.values():
+    # Snapshot under the lock to keep len() and the per-status tally consistent.
+    with _jobs_lock:
+        snapshot = list(_jobs.values())
+    by_status: dict[str, int] = {}
+    for j in snapshot:
         by_status[j["status"]] = by_status.get(j["status"], 0) + 1
-    return {"total_jobs_in_memory": total, "by_status": by_status}
+    return {"total_jobs_in_memory": len(snapshot), "by_status": by_status}
 # ─── Observability / Debug endpoints ─────────────────────────────────────────
 # These endpoints are for developer use only (agent optimization analysis).
 # They are NOT intended for the end-user frontend.
@@ -657,7 +724,6 @@ async def debug_sessions():
 @app.get("/debug/session/{session_id}", tags=["debug"], summary="Full session log with tool calls",
          dependencies=[Depends(_require_debug_auth)])
 async def debug_session_logs(session_id: str):
-    _validate_session_id(session_id)
     """
     Full chronological log of a session grouped by turn.
 
@@ -671,6 +737,7 @@ async def debug_session_logs(session_id: str):
     Useful for: reviewing what SQL the agent wrote, how many iterations it took,
     whether it used the right tables, whether tool results were large/expensive.
     """
+    _validate_session_id(session_id)
     try:
         from chat_logger import get_logger
         from config import DB_PATH
@@ -705,11 +772,11 @@ async def debug_session_logs(session_id: str):
 @app.get("/debug/session/{session_id}/turn/{turn_index}", tags=["debug"], summary="Log for one specific turn",
          dependencies=[Depends(_require_debug_auth)])
 async def debug_turn_logs(session_id: str, turn_index: int):
-    _validate_session_id(session_id)
     """
     Detailed event log for a single turn within a session.
     Useful for deep-diving into one specific question the user asked.
     """
+    _validate_session_id(session_id)
     try:
         from chat_logger import get_logger
         from config import DB_PATH
@@ -793,6 +860,9 @@ async def segment_chat(
             status_code=400,
             detail=f"Unknown model '{req.model}'. Allowed: {list(ALLOWED_MODELS.keys())}",
         )
+    if req.session_id:
+        _validate_session_id(req.session_id)
+    _validate_x_user_id(x_user_id)
     from segment_agent import get_segment_agent
     from segment_store import _SHARED_OWNER
     owner = x_user_id or _SHARED_OWNER
@@ -830,6 +900,7 @@ async def list_segments(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """Список сегментов текущего пользователя (X-User-Id), отсортированных по дате обновления."""
+    _validate_x_user_id(x_user_id)
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     store = get_segment_store()
@@ -847,6 +918,7 @@ async def get_segment(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """Получить сегмент по ID. Возвращает 404 если сегмент не найден или принадлежит другому пользователю."""
+    _validate_x_user_id(x_user_id)
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     store = get_segment_store()
@@ -866,6 +938,7 @@ async def delete_segment(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """Удалить сегмент. Возвращает 404 если сегмент не найден или принадлежит другому пользователю."""
+    _validate_x_user_id(x_user_id)
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     store = get_segment_store()

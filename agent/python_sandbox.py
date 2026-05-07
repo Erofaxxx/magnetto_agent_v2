@@ -162,6 +162,16 @@ def _truncate_on_newlines(text: str, max_len: int, *, label: str = "output") -> 
 _tls = threading.local()
 _figure_lock = threading.Lock()  # guards plt.get_fignums() snapshots across parallel calls
 
+# Process-wide lock around the body of PythonSandbox.execute(). matplotlib +
+# pandas are full of mutable global state (rcParams, display options,
+# pd.read_parquet / DataFrame.to_parquet method slots), and "scope the patch
+# to execute()" only restores correctly when calls don't interleave. Two
+# parallel sandbox calls would otherwise leave pd.read_parquet permanently
+# pointing at our wrapper. Serialising sandbox runs is the simplest fix
+# and the practical cost is small: python_analysis already shares a single
+# matplotlib backend across the process anyway.
+_sandbox_lock = threading.Lock()
+
 _orig_plt_close   = plt.close
 _orig_plt_savefig = plt.savefig
 _orig_plt_show    = plt.show
@@ -287,16 +297,37 @@ _orig_pd_to_parquet = pd.DataFrame.to_parquet
 
 
 def _virtual_to_parquet(self, path=None, *args, **kwargs):
-    """Map `/parquet/<file>` → `<session.parquet_dir>/<file>` before writing."""
-    if isinstance(path, str) and path.startswith("/parquet/"):
-        try:
-            from core.session_context import get_current_session
-            sess = get_current_session()
-            if sess is not None:
-                target_dir = sess.parquet_dir  # auto-creates if missing
-                path = str(target_dir / path[len("/parquet/"):])
-        except Exception:
-            pass  # fall through, original error will surface
+    """
+    Map `/parquet/<file>` → `<session.parquet_dir>/<file>` before writing,
+    and refuse any absolute write path that doesn't resolve under TEMP_DIR.
+
+    Without the absolute-path check the AST sandbox is bypassable: even with
+    `__import__('os')` blocked, agent code could still call
+    `df.to_parquet('/etc/cron.daily/x')` via pyarrow's filesystem layer and
+    drop a file outside the data area.
+    """
+    if isinstance(path, str):
+        if path.startswith("/parquet/"):
+            try:
+                from core.session_context import get_current_session
+                sess = get_current_session()
+                if sess is not None:
+                    target_dir = sess.parquet_dir  # auto-creates if missing
+                    path = str(target_dir / path[len("/parquet/"):])
+            except Exception:
+                pass  # fall through, original error will surface
+        else:
+            from pathlib import Path as _Path
+            p = _Path(path)
+            if p.is_absolute():
+                from config import TEMP_DIR as _TEMP_DIR
+                temp_root = _Path(_TEMP_DIR).resolve()
+                try:
+                    p.resolve().relative_to(temp_root)
+                except ValueError:
+                    raise PermissionError(
+                        f"Sandbox: writing parquet outside TEMP_DIR is not allowed: {path}"
+                    )
     return _orig_pd_to_parquet(self, path, *args, **kwargs)
 
 
@@ -395,6 +426,13 @@ class PythonSandbox:
                 "plots": [],
                 "error": f"Sandbox rejected the code: {exc}",
             }
+
+        # Serialise sandbox runs across the whole process — see _sandbox_lock
+        # docstring at module top for why this is mandatory.
+        with _sandbox_lock:
+            return self._execute_locked(code, parquet_path)
+
+    def _execute_locked(self, code: str, parquet_path: str) -> dict:
 
         # ── Load data from Parquet (with coercions applied by _safe_read_parquet) ─
         try:

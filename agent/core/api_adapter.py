@@ -97,7 +97,10 @@ def analyze_deepagents(
         _err_msgs = []
         try:
             snapshot = agent.get_state(config)
-            _err_msgs = list(snapshot.values.get("messages", []))
+            # snapshot.values is None on cold checkpoints (no graph state yet);
+            # guard against AttributeError so the recovery path itself doesn't
+            # raise and mask the real error.
+            _err_msgs = list((snapshot.values or {}).get("messages", []))
         except Exception:
             pass
         return {
