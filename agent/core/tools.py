@@ -128,11 +128,16 @@ def _save_plots_to_session(plots_b64: list[str], *, hint: str = "") -> list[dict
 
     # Append to /plots/index.md.
     # `hint` originates from agent code (chart_hint=...) which the LLM
-    # composes from prompt-injectable user data; restrict to a safe whitelist
-    # (alphanumerics + Unicode word chars + a few punctuations) so a hostile
-    # hint can't smuggle a heading (`#`), emphasis (`*`/`_`), link
-    # (`[text](url)`), backticks, pipes or newlines into the file.
-    safe_hint = re.sub(r"[^\w\s\-./()]", " ", (hint or "untitled chart"), flags=re.UNICODE)
+    # composes from prompt-injectable user data. Whitelist explicit ASCII +
+    # Cyrillic chars only — `\w` would have included `_`, leaving markdown
+    # emphasis like `_italic_` intact. Two passes: whitelist first, then a
+    # belt-and-braces deny-list of any markdown control chars that slipped.
+    safe_hint = re.sub(
+        r"[^A-Za-z0-9Ѐ-ӿ\s\-./()]",
+        " ",
+        hint or "untitled chart",
+    )
+    safe_hint = re.sub(r"[*_\[\]\\`#|]", " ", safe_hint)
     safe_hint = re.sub(r"\s+", " ", safe_hint).strip() or "untitled chart"
     try:
         ctx = get_current_session()

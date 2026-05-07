@@ -514,6 +514,12 @@ async def _run_agent_job(job_id: str) -> None:
                     "started_at": started_at,
                 }
             )
+            # _messages was needed only by the logger; drop it from the cached
+            # job result to free ~100KB+ per turn (it's held until JOB_TTL).
+            with _jobs_lock:
+                _job = _jobs.get(job_id)
+                if _job is not None and isinstance(_job.get("result"), dict):
+                    _job["result"].pop("_messages", None)
         except Exception as log_exc:
             print(f"[ChatLogger] enqueue error (non-fatal): {log_exc}")
 
@@ -1310,8 +1316,13 @@ async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
 
 
 def _cabinets_are_stale() -> bool:
-    """True if the last cabinet refresh failed more recently than the last success."""
-    return _cabinet_cache["last_error_at"] > _cabinet_cache["fetched_at"]
+    """True if the last cabinet refresh failed more recently than the last success.
+
+    Reads both timestamps under the cache lock so we never see a torn pair
+    (e.g. updated `last_error_at` against a stale `fetched_at`).
+    """
+    with _cabinet_cache_lock:
+        return _cabinet_cache["last_error_at"] > _cabinet_cache["fetched_at"]
 
 
 @app.get("/api/tables", tags=["tables"], summary="Список доступных именованных запросов")
@@ -1500,9 +1511,8 @@ def _get_reports_client():
         if _reports_ch_client is not None:
             return _reports_ch_client
 
-        import os
-        user = (os.environ.get("CLICKHOUSE_REPORTS_USER") or "").strip()
-        password = (os.environ.get("CLICKHOUSE_REPORTS_PASSWORD") or "").strip()
+        user = (_os.environ.get("CLICKHOUSE_REPORTS_USER") or "").strip()
+        password = (_os.environ.get("CLICKHOUSE_REPORTS_PASSWORD") or "").strip()
         if not user or not password:
             return None
 
@@ -1583,10 +1593,17 @@ async def get_budget(cabinet_name: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Invalid cabinet_name")
     # Plus runtime allowlist: same shape check as /api/tables/{name}, prevents
     # an unknown cabinet from being interpolated into SQL even with a
-    # well-formed regex match.
+    # well-formed regex match. If the cache is empty (cold start / discovery
+    # failed) we refuse to proceed instead of accepting any alphanum string —
+    # better to 503 than to fall back to "regex only".
     if cabinet_name is not None:
         _allowed_cabs = await _get_available_cabinets()
-        if _allowed_cabs and cabinet_name not in _allowed_cabs:
+        if not _allowed_cabs:
+            raise HTTPException(
+                status_code=503,
+                detail="Cabinet allowlist unavailable; retry later",
+            )
+        if cabinet_name not in _allowed_cabs:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown cabinet '{cabinet_name}'",
