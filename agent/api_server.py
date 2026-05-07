@@ -103,6 +103,54 @@ def _validate_x_user_id(x_user_id: Optional[str]) -> Optional[str]:
 _running_tasks: set[asyncio.Task] = set()
 
 
+# ─── ChatLogger background writer ────────────────────────────────────────────
+# Earlier code spawned 2 daemon threads per analyze() call. Under load that
+# was an unbounded thread fan-out and an inconsistent shutdown experience —
+# daemon=True kills mid-INSERT, daemon=False blocks SIGTERM. The writer
+# below consumes a single Queue from a single long-lived thread, so the
+# work is bounded and a clean shutdown can drain via a sentinel.
+import queue as _queue_mod
+_log_queue: "_queue_mod.Queue[Optional[dict]]" = _queue_mod.Queue(maxsize=10_000)
+_log_writer_thread: Optional[_threading.Thread] = None
+
+
+def _enqueue_log(item: dict) -> None:
+    """Best-effort enqueue. Drops the item if the queue is saturated rather
+    than blocking the request thread — observability must never throttle the
+    user-facing path."""
+    try:
+        _log_queue.put_nowait(item)
+    except _queue_mod.Full:
+        print("[ChatLogger] queue full, dropping log item")
+
+
+def _log_writer_loop() -> None:
+    """Single consumer of `_log_queue`. None is the shutdown sentinel."""
+    from chat_logger import get_logger
+    from config import DB_PATH
+    logger = get_logger(DB_PATH)
+    while True:
+        item = _log_queue.get()
+        try:
+            if item is None:
+                return
+            kind = item.get("kind")
+            if kind == "turn":
+                logger.log_turn(item["session_id"], item["msgs"], item["started_at"])
+            elif kind == "router":
+                logger.log_router(
+                    item["session_id"],
+                    item["turn_index"],
+                    item["active_skills"],
+                    item["query"],
+                    item["started_at"],
+                )
+        except Exception as exc:
+            print(f"[ChatLogger] write error (item={item.get('kind')}): {exc}")
+        finally:
+            _log_queue.task_done()
+
+
 # ─── Analytics-session ownership (in-memory) ─────────────────────────────────
 # Mirrors segment_store.session_owned_by but for the main analytics flow.
 # Stored in-process: analytics jobs themselves live in _jobs (also in-memory),
@@ -228,6 +276,13 @@ async def _lifespan(app: FastAPI):
         from agent import get_agent
         get_agent()
     cleanup_task = asyncio.create_task(_cleanup_loop())
+    # Start the chat-logger writer thread now so /api/analyze can immediately
+    # enqueue without checking. Sentinel is pushed in finally below.
+    global _log_writer_thread
+    _log_writer_thread = _threading.Thread(
+        target=_log_writer_loop, daemon=True, name="chat-log-writer"
+    )
+    _log_writer_thread.start()
     print(f"✅ ClickHouse Analytics Agent API started | {SERVER_URL}")
     try:
         yield
@@ -245,6 +300,14 @@ async def _lifespan(app: FastAPI):
         # this the lifespan returns before pending cancellations finish, and
         # uvicorn destroys the loop while tasks are still in cancellation.
         await asyncio.gather(cleanup_task, *in_flight, return_exceptions=True)
+        # Flush the log queue: push the sentinel and give the writer up to
+        # 5 seconds to drain. Daemon=True still bounds shutdown if it hangs.
+        try:
+            _log_queue.put_nowait(None)
+        except _queue_mod.Full:
+            pass
+        if _log_writer_thread is not None:
+            _log_writer_thread.join(timeout=5.0)
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -424,35 +487,35 @@ async def _run_agent_job(job_id: str) -> None:
         _set_done(job_id, result)
 
         # ── Passive observability logging ──────────────────────────────────
-        # Agent is already done and result is stored. Logger runs in a
-        # daemon thread so a stuck SQLite writer doesn't block process
-        # shutdown (`systemctl restart` would otherwise wait for them).
+        # Agent is already done and result is stored. We push the work onto
+        # a single background queue (see _log_queue + _log_writer_loop) so
+        # we don't spawn 2 new threads per request — under load the daemon
+        # fan-out pattern was killed mid-write on shutdown and lost log rows.
         try:
-            import threading as _threading
-            from chat_logger import get_logger
-            from config import DB_PATH
-            logger = get_logger(DB_PATH)
-
-            msgs = result.get("_messages", [])
-            if msgs:
-                _threading.Thread(
-                    target=logger.log_turn,
-                    args=(job["session_id"], msgs, started_at),
-                    daemon=True,
-                ).start()
-
-            # Log router result (which skills Haiku selected for this turn)
-            active_skills = result.get("_active_skills", [])
             from langchain_core.messages import HumanMessage as _HM
+            msgs = result.get("_messages", [])
+            active_skills = result.get("_active_skills", [])
             turn_index = sum(1 for m in msgs if isinstance(m, _HM))
-            _threading.Thread(
-                target=logger.log_router,
-                args=(job["session_id"], turn_index, active_skills,
-                      job.get("query", ""), started_at),
-                daemon=True,
-            ).start()
+            _enqueue_log(
+                {
+                    "kind": "turn",
+                    "session_id": job["session_id"],
+                    "msgs": msgs,
+                    "started_at": started_at,
+                }
+            )
+            _enqueue_log(
+                {
+                    "kind": "router",
+                    "session_id": job["session_id"],
+                    "turn_index": turn_index,
+                    "active_skills": active_skills,
+                    "query": job.get("query", ""),
+                    "started_at": started_at,
+                }
+            )
         except Exception as log_exc:
-            print(f"[ChatLogger] init error (non-fatal): {log_exc}")
+            print(f"[ChatLogger] enqueue error (non-fatal): {log_exc}")
 
     except asyncio.TimeoutError:
         _set_error(job_id, f"Job exceeded {JOB_TIMEOUT_SECONDS}s timeout")
@@ -1220,8 +1283,9 @@ async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
         import pandas as _pd
 
         ch = _get_ch_client()
+        from config import CLICKHOUSE_DATABASE as _CH_DB
         sql = (
-            "SELECT DISTINCT cabinet_name FROM magnetto.bad_placements "
+            f"SELECT DISTINCT cabinet_name FROM {_CH_DB}.bad_placements "
             "WHERE cabinet_name != '' ORDER BY cabinet_name"
         )
         result = await asyncio.to_thread(_ch_query_locked, ch, sql)
@@ -1425,43 +1489,48 @@ def _get_reports_client():
     loser.
     """
     global _reports_ch_client
+    # Cheap path: client already initialised, no lock needed.
     if _reports_ch_client is not None:
         return _reports_ch_client
+    # Slow path: hold the lock from re-check through to assignment so
+    # two parallel first-callers don't both end up calling get_client().
+    # Earlier versions exited the `with` block before the construction —
+    # that defeated the whole point of the lock.
     with _reports_ch_lock:
         if _reports_ch_client is not None:
             return _reports_ch_client
 
-    import os
-    user = (os.environ.get("CLICKHOUSE_REPORTS_USER") or "").strip()
-    password = (os.environ.get("CLICKHOUSE_REPORTS_PASSWORD") or "").strip()
-    if not user or not password:
-        return None
+        import os
+        user = (os.environ.get("CLICKHOUSE_REPORTS_USER") or "").strip()
+        password = (os.environ.get("CLICKHOUSE_REPORTS_PASSWORD") or "").strip()
+        if not user or not password:
+            return None
 
-    try:
-        import clickhouse_connect
-        from clickhouse_client import _ch_tls_verify_kwargs
-        from config import (
-            CLICKHOUSE_HOST,
-            CLICKHOUSE_PORT,
-            CLICKHOUSE_DATABASE,
-        )
-        connect_kwargs = {
-            "host": CLICKHOUSE_HOST,
-            "port": CLICKHOUSE_PORT,
-            "username": user,
-            "password": password,
-            "database": CLICKHOUSE_DATABASE,
-            "secure": True,
-            "connect_timeout": 30,
-            "send_receive_timeout": 600,
-        }
-        connect_kwargs.update(_ch_tls_verify_kwargs())
-        _reports_ch_client = clickhouse_connect.get_client(**connect_kwargs)
-        print(f"✅ Reports CH client connected as {user}")
-        return _reports_ch_client
-    except Exception as exc:
-        print(f"⚠️  Reports CH client init failed: {exc}")
-        return None
+        try:
+            import clickhouse_connect
+            from clickhouse_client import _ch_tls_verify_kwargs
+            from config import (
+                CLICKHOUSE_HOST,
+                CLICKHOUSE_PORT,
+                CLICKHOUSE_DATABASE,
+            )
+            connect_kwargs = {
+                "host": CLICKHOUSE_HOST,
+                "port": CLICKHOUSE_PORT,
+                "username": user,
+                "password": password,
+                "database": CLICKHOUSE_DATABASE,
+                "secure": True,
+                "connect_timeout": 30,
+                "send_receive_timeout": 600,
+            }
+            connect_kwargs.update(_ch_tls_verify_kwargs())
+            _reports_ch_client = clickhouse_connect.get_client(**connect_kwargs)
+            print(f"✅ Reports CH client connected as {user}")
+            return _reports_ch_client
+        except Exception as exc:
+            print(f"⚠️  Reports CH client init failed: {exc}")
+            return None
 
 
 def _reports_query_dicts(sql: str, required: bool = True) -> list[dict]:

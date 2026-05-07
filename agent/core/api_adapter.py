@@ -305,7 +305,8 @@ def _extract_plot_urls(messages: list) -> list[str]:
             continue
         try:
             data = json.loads(msg.content)
-            urls.extend(data.get("plot_urls", []) or [])
+            if isinstance(data, dict):
+                urls.extend(data.get("plot_urls", []) or [])
         except Exception:
             pass
     return urls

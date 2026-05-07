@@ -3,7 +3,10 @@ Named ClickHouse queries for GET /api/tables/{query_name}.
 
 Структура каждого запроса:
   description             — короткое описание для фронта
-  sql                     — SELECT без ORDER BY и LIMIT (добавляются динамически)
+  sql                     — SELECT без ORDER BY и LIMIT (добавляются динамически).
+                            `{db}.<table>` подставляется в момент импорта из
+                            config.CLICKHOUSE_DATABASE — мультитенантный
+                            деплой переключается через env, без правки кода.
   sortable_columns        — белый список колонок, по которым разрешена сортировка
   filterable_zone_status  — флаг: поддерживается ли фильтрация по zone_status
   filterable_cabinet      — флаг: поддерживается ли фильтрация по cabinet_name
@@ -13,7 +16,10 @@ Named ClickHouse queries for GET /api/tables/{query_name}.
 Добавляй новые запросы сюда — endpoint подхватит их автоматически.
 """
 
-QUERIES: dict[str, dict] = {
+from config import CLICKHOUSE_DATABASE as _CH_DB
+
+
+_QUERIES_TEMPLATES: dict[str, dict] = {
     "bad_placements": {
         "description": "Плохие площадки",
         "sql": """
@@ -33,7 +39,7 @@ QUERIES: dict[str, dict] = {
                 zone_status,
                 zone_reason,
                 cabinet_name
-            FROM magnetto.bad_placements
+            FROM {db}.bad_placements
             WHERE (zone_status != 'pending' OR zone_status IS NULL)
         """,
         "sortable_columns": ["Placement", "CampaignName", "cpc", "cost", "clicks", "purchase_revenue", "roas", "goal_score_rate", "tier12_conversions", "med_cpc_campaign", "med_gsr_campaign", "med_roas_campaign", "zone_status", "cabinet_name"],
@@ -59,7 +65,7 @@ QUERIES: dict[str, dict] = {
                 med_goal_score_rate,
                 zone_status,
                 cabinet_name
-            FROM magnetto.bad_keywords
+            FROM {db}.bad_keywords
             WHERE (zone_status != 'pending')
         """,
         "sortable_columns": ["Criterion", "CampaignName", "AdGroupName", "cpc", "goal_score_rate", "avg_bid", "cpc_to_bid_ratio", "purchase_revenue", "roas", "med_roas", "tier12_conversions", "med_goal_score_rate", "zone_status", "cabinet_name"],
@@ -83,7 +89,7 @@ QUERIES: dict[str, dict] = {
                 `zone_status`,
                 `zone_reason`,
                 cabinet_name
-            FROM magnetto.bad_queries
+            FROM {db}.bad_queries
             WHERE (zone_status != 'pending')
         """,
         "sortable_columns": ["Query", "CriterionType", "CampaignName", "TargetingCategory", "roas", "goal_score_rate", "cost", "clicks", "cpc", "bounce_rate", "zone_status", "zone_reason", "cabinet_name"],
@@ -105,9 +111,19 @@ QUERIES: dict[str, dict] = {
                 action_conversion_lift,
                 analyst_comment,
                 report_date
-            FROM magnetto.report_daily_briefing
+            FROM {db}.report_daily_briefing
         """,
         "sortable_columns": ["client_id", "priority", "total_visits", "days_since_last_visit", "lift_score", "retarget_in_days", "action_conversion_lift", "report_date"],
         "filterable_zone_status": False,
     },
 }
+
+
+def _resolve(template: dict) -> dict:
+    """Substitute the {db} placeholder in `sql` with the current CH database."""
+    out = dict(template)
+    out["sql"] = out["sql"].format(db=_CH_DB)
+    return out
+
+
+QUERIES: dict[str, dict] = {name: _resolve(spec) for name, spec in _QUERIES_TEMPLATES.items()}

@@ -128,10 +128,12 @@ def _save_plots_to_session(plots_b64: list[str], *, hint: str = "") -> list[dict
 
     # Append to /plots/index.md.
     # `hint` originates from agent code (chart_hint=...) which the LLM
-    # composes from prompt-injectable user data; strip newlines and
-    # markdown-control characters so a hostile hint can't break the file
-    # structure or smuggle a fake heading.
-    safe_hint = re.sub(r"[\r\n`|]", " ", (hint or "untitled chart")).strip() or "untitled chart"
+    # composes from prompt-injectable user data; restrict to a safe whitelist
+    # (alphanumerics + Unicode word chars + a few punctuations) so a hostile
+    # hint can't smuggle a heading (`#`), emphasis (`*`/`_`), link
+    # (`[text](url)`), backticks, pipes or newlines into the file.
+    safe_hint = re.sub(r"[^\w\s\-./()]", " ", (hint or "untitled chart"), flags=re.UNICODE)
+    safe_hint = re.sub(r"\s+", " ", safe_hint).strip() or "untitled chart"
     try:
         ctx = get_current_session()
         if ctx is not None:

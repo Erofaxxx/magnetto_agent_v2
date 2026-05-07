@@ -38,8 +38,19 @@ from langchain_core.messages import HumanMessage, ToolMessage
 _DEFAULT_BUDGET = int(os.environ.get("MAX_AGENT_ITERATIONS", "30"))
 
 
+# Tool messages emitted by deepagents' structured-response machinery don't
+# represent real iteration cost — they're the LLM's way of returning the
+# final answer. Counting them inflates `used` by 1 at exactly the moment we
+# can least afford it (the strip step then deletes the structured output).
+_NON_BUDGET_TOOL_NAMES = frozenset({
+    "MainFinalAnswer",
+    "SubagentResult",
+})
+
+
 def _count_tool_calls(state: dict) -> int:
-    """Count ToolMessages since last HumanMessage (current user turn)."""
+    """Count ToolMessages since last HumanMessage (current user turn),
+    excluding structured-response sentinels that don't count toward budget."""
     messages = state.get("messages") or []
     # find last human index
     from langchain_core.messages import HumanMessage
@@ -49,7 +60,11 @@ def _count_tool_calls(state: dict) -> int:
             last_h = i
     if last_h < 0:
         return 0
-    return sum(1 for m in messages[last_h:] if isinstance(m, ToolMessage))
+    return sum(
+        1 for m in messages[last_h:]
+        if isinstance(m, ToolMessage)
+        and getattr(m, "name", None) not in _NON_BUDGET_TOOL_NAMES
+    )
 
 
 def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None:
