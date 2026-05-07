@@ -16,6 +16,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import threading
@@ -61,10 +62,13 @@ def _get_ch_client():
 
 def _relocate_parquet_to_session(physical_path: str) -> str:
     """
-    The ClickHouseClient currently writes parquet into its own TEMP_DIR.
-    If session directory differs, move the file there so the file survives
-    between turns in this session (not shared with other sessions).
-    Returns the final physical path.
+    The ClickHouseClient writes parquet into its own TEMP_DIR (keyed by SQL
+    hash, used as the cache slot). We surface a copy in the session dir so
+    the file survives across turns within this session, but we KEEP the
+    original in TEMP_DIR — otherwise the next identical-SQL request misses
+    the cache (`p.exists()` would be False) and ClickHouse is hit again.
+
+    Returns the session-local path (or the original on any FS hiccup).
     """
     try:
         src = Path(physical_path)
@@ -74,12 +78,15 @@ def _relocate_parquet_to_session(physical_path: str) -> str:
         if dst_dir.resolve() == src.parent.resolve():
             return physical_path  # already in session dir
         dst = dst_dir / src.name
-        # move (hardlink if same FS, else copy+delete)
+        # Copy (preserves cache slot in TEMP_DIR for hash-based lookups).
+        # Hardlink first when the FS supports it — same on-disk inode, near-zero
+        # cost, no extra space; fall back to a plain copy across filesystems.
         try:
-            src.replace(dst)
+            if dst.exists():
+                dst.unlink()
+            os.link(src, dst)
         except OSError:
             shutil.copy2(src, dst)
-            src.unlink(missing_ok=True)
         return str(dst)
     except Exception:
         return physical_path  # never fail the tool for a filesystem hiccup

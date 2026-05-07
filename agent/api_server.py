@@ -50,6 +50,19 @@ def _validate_session_id(session_id: str) -> str:
 
 
 _X_USER_ID_RE = _re_mod.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
+_SEGMENT_ID_RE = _re_mod.compile(r"^seg_[A-Za-z0-9]{4,32}$")
+
+
+def _validate_segment_id(segment_id: str) -> str:
+    """Reject malformed segment_id BEFORE it hits SQLite.
+
+    SegmentStore generates ids as `seg_<uuid4-hex[:8]>`; the regex above is
+    a superset of the spawn pattern so we don't break legacy ids while still
+    bounding length and character set.
+    """
+    if not _SEGMENT_ID_RE.match(segment_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid segment_id")
+    return segment_id
 
 
 def _validate_x_user_id(x_user_id: Optional[str]) -> Optional[str]:
@@ -72,6 +85,20 @@ def _validate_x_user_id(x_user_id: Optional[str]) -> Optional[str]:
 # (see https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
 # We add each job task here and self-remove on completion.
 _running_tasks: set[asyncio.Task] = set()
+
+
+def _ch_query_locked(ch, sql: str):
+    """Acquire `_ch_lock` and run a single ClickHouse query.
+
+    The lock MUST be held inside the worker thread, not around the awaitable:
+    `with _ch_lock: await asyncio.to_thread(...)` would block the event loop
+    for the whole query duration because acquiring a non-reentrant
+    threading.Lock from the loop thread parks every other coroutine. Holding
+    the lock inside the thread keeps the loop free.
+    """
+    from tools import _ch_lock
+    with _ch_lock:
+        return ch.execute_query(sql)
 
 
 # ─── Debug-endpoint authorization ─────────────────────────────────────────────
@@ -116,7 +143,14 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
+        # Cancel the periodic cleanup loop and any in-flight job tasks so
+        # the process can exit promptly on SIGTERM. asyncio.wait_for inside
+        # _run_agent_job will see CancelledError and bail; the underlying
+        # thread keeps running until it finishes naturally (Python can't
+        # cancel threads), but the event loop is no longer blocked on it.
         cleanup_task.cancel()
+        for t in list(_running_tasks):
+            t.cancel()
         try:
             await cleanup_task
         except (asyncio.CancelledError, Exception):
@@ -258,9 +292,15 @@ class JobStatusResponse(BaseModel):
 async def _run_agent_job(job_id: str) -> None:
     """Run the agent in a thread pool and store the result in _jobs.
 
-    A hard timeout (JOB_TIMEOUT_SECONDS) guarantees a single hung LLM/CH
-    call cannot occupy a thread-pool slot indefinitely; on timeout we
-    set status="error" so the client sees a definitive failure.
+    `asyncio.wait_for(JOB_TIMEOUT_SECONDS)` releases the awaiting coroutine
+    on timeout and lets the client poll a definitive `error` status. Note
+    that Python cannot cancel a running thread, so the underlying agent
+    keeps executing on the default executor until it returns naturally —
+    the slot is occupied for at most `JOB_TIMEOUT_SECONDS + actual runtime`.
+    A misbehaving LLM/ClickHouse stall therefore still consumes one
+    executor slot until completion; a dedicated bounded ThreadPoolExecutor
+    plus `cancel_futures=True` would be the next step if that becomes a
+    bottleneck under load.
     """
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -295,7 +335,8 @@ async def _run_agent_job(job_id: str) -> None:
 
         # ── Passive observability logging ──────────────────────────────────
         # Agent is already done and result is stored. Logger runs in a
-        # daemon thread — any failure is silently swallowed, never affects agent.
+        # daemon thread so a stuck SQLite writer doesn't block process
+        # shutdown (`systemctl restart` would otherwise wait for them).
         try:
             import threading as _threading
             from chat_logger import get_logger
@@ -307,7 +348,7 @@ async def _run_agent_job(job_id: str) -> None:
                 _threading.Thread(
                     target=logger.log_turn,
                     args=(job["session_id"], msgs, started_at),
-                    daemon=False,
+                    daemon=True,
                 ).start()
 
             # Log router result (which skills Haiku selected for this turn)
@@ -318,7 +359,7 @@ async def _run_agent_job(job_id: str) -> None:
                 target=logger.log_router,
                 args=(job["session_id"], turn_index, active_skills,
                       job.get("query", ""), started_at),
-                daemon=False,
+                daemon=True,
             ).start()
         except Exception as log_exc:
             print(f"[ChatLogger] init error (non-fatal): {log_exc}")
@@ -864,9 +905,13 @@ async def segment_chat(
         _validate_session_id(req.session_id)
     _validate_x_user_id(x_user_id)
     from segment_agent import get_segment_agent
-    from segment_store import _SHARED_OWNER
+    from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
     session_id = req.session_id or str(uuid.uuid4())
+    # Bind the session to the current owner on first contact (INSERT OR IGNORE
+    # so subsequent messages can't switch ownership). Required for the
+    # auth check in GET /api/segment/chat/{session_id}/history.
+    await asyncio.to_thread(get_segment_store().record_session_owner, session_id, owner)
     agent = get_segment_agent(req.model)
     result = await asyncio.to_thread(agent.chat, req.message, session_id, owner)
     return SegmentChatResponse(
@@ -883,9 +928,27 @@ async def segment_chat(
     tags=["segmentation"],
     summary="Get segmentation dialogue history",
 )
-async def get_segment_chat_history(session_id: str):
-    """История диалога сессии сегментации в формате [{role, content}]."""
+async def get_segment_chat_history(
+    session_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
+    """История диалога сессии сегментации в формате [{role, content}].
+
+    Validate session_id shape AND require the same X-User-Id used to create
+    the session (or the shared placeholder for anonymous sessions). Without
+    that check anyone who learns a uuid4 could read another user's
+    segmentation dialogue (which contains SQL and segment plan text).
+    """
+    _validate_session_id(session_id)
+    _validate_x_user_id(x_user_id)
     from segment_agent import get_segment_agent
+    from segment_store import _SHARED_OWNER, get_segment_store
+    owner = x_user_id or _SHARED_OWNER
+    store = get_segment_store()
+    if not await asyncio.to_thread(store.session_owned_by, session_id, owner):
+        # Mask presence: same 404 whether the session exists for someone else
+        # or doesn't exist at all.
+        raise HTTPException(status_code=404, detail="Session not found")
     agent = get_segment_agent()
     history = await asyncio.to_thread(agent.get_session_history, session_id)
     return {"session_id": session_id, "history": history}
@@ -918,6 +981,7 @@ async def get_segment(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """Получить сегмент по ID. Возвращает 404 если сегмент не найден или принадлежит другому пользователю."""
+    _validate_segment_id(segment_id)
     _validate_x_user_id(x_user_id)
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
@@ -938,6 +1002,7 @@ async def delete_segment(
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """Удалить сегмент. Возвращает 404 если сегмент не найден или принадлежит другому пользователю."""
+    _validate_segment_id(segment_id)
     _validate_x_user_id(x_user_id)
     from segment_store import _SHARED_OWNER, get_segment_store
     owner = x_user_id or _SHARED_OWNER
@@ -1006,7 +1071,7 @@ async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
         return _cabinet_cache["values"]
 
     try:
-        from tools import _ch_lock, _get_ch_client
+        from tools import _get_ch_client
         import pandas as _pd
 
         ch = _get_ch_client()
@@ -1014,8 +1079,7 @@ async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
             "SELECT DISTINCT cabinet_name FROM magnetto.bad_placements "
             "WHERE cabinet_name != '' ORDER BY cabinet_name"
         )
-        with _ch_lock:
-            result = await asyncio.to_thread(ch.execute_query, sql)
+        result = await asyncio.to_thread(_ch_query_locked, ch, sql)
         if result.get("success"):
             df = _pd.read_parquet(result["parquet_path"])
             cabinets = [str(v) for v in df["cabinet_name"].dropna().tolist()]
@@ -1136,10 +1200,16 @@ async def get_table_data(
         from tools import _ch_lock, _get_ch_client
         ch = _get_ch_client()
         # Hold the lock across both queries so another caller can't slip in
-        # between and stale the count vs the page we just fetched.
-        with _ch_lock:
-            result = await asyncio.to_thread(ch.execute_query, sql)
-            count_result = await asyncio.to_thread(ch.execute_query, count_sql)
+        # between and stale the count vs the page we just fetched. The lock
+        # is acquired inside the worker thread to avoid blocking the event
+        # loop while we wait for ClickHouse — see _ch_query_locked.
+        def _both():
+            with _ch_lock:
+                return (
+                    ch.execute_query(sql),
+                    ch.execute_query(count_sql),
+                )
+        result, count_result = await asyncio.to_thread(_both)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

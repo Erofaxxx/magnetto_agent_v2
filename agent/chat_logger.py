@@ -144,68 +144,79 @@ class ChatLogger:
             print(f"[ChatLogger] WARNING: log_router failed silently: {exc}")
 
     def get_session_logs(self, session_id: str) -> list[dict]:
-        """Return all events for a session, ordered by turn and seq."""
-        cur = self._conn.execute(
-            """SELECT id, turn_index, seq, event_type, tool_name,
-                      tool_call_id, content, token_est, created_at
-               FROM agent_logs
-               WHERE session_id = ?
-               ORDER BY turn_index, seq, id""",
-            (session_id,),
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        """Return all events for a session, ordered by turn and seq.
+
+        Reads share the same single sqlite3.Connection as writers (above);
+        sqlite3.Connection objects are NOT safe for concurrent use, so we
+        guard reads with `self._lock` to prevent ProgrammingError /
+        SQLITE_MISUSE when /debug endpoints fire while _run_agent_job
+        threads are writing.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT id, turn_index, seq, event_type, tool_name,
+                          tool_call_id, content, token_est, created_at
+                   FROM agent_logs
+                   WHERE session_id = ?
+                   ORDER BY turn_index, seq, id""",
+                (session_id,),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def get_sessions(self) -> list[dict]:
         """Summary list of all sessions — for a sessions browser."""
-        cur = self._conn.execute(
-            """SELECT
-                   session_id,
-                   MAX(turn_index)                                        AS turns,
-                   SUM(token_est)                                         AS total_tokens_est,
-                   COUNT(*) FILTER (WHERE event_type = 'tool_call')      AS tool_calls,
-                   MIN(created_at)                                        AS started_at,
-                   MAX(created_at)                                        AS last_active
-               FROM agent_logs
-               GROUP BY session_id
-               ORDER BY last_active DESC"""
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT
+                       session_id,
+                       MAX(turn_index)                                        AS turns,
+                       SUM(token_est)                                         AS total_tokens_est,
+                       COUNT(*) FILTER (WHERE event_type = 'tool_call')      AS tool_calls,
+                       MIN(created_at)                                        AS started_at,
+                       MAX(created_at)                                        AS last_active
+                   FROM agent_logs
+                   GROUP BY session_id
+                   ORDER BY last_active DESC"""
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def get_turn(self, session_id: str, turn_index: int) -> list[dict]:
         """All events for one specific turn."""
-        cur = self._conn.execute(
-            """SELECT id, seq, event_type, tool_name, tool_call_id,
-                      content, token_est, created_at
-               FROM agent_logs
-               WHERE session_id = ? AND turn_index = ?
-               ORDER BY seq, id""",
-            (session_id, turn_index),
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                """SELECT id, seq, event_type, tool_name, tool_call_id,
+                          content, token_est, created_at
+                   FROM agent_logs
+                   WHERE session_id = ? AND turn_index = ?
+                   ORDER BY seq, id""",
+                (session_id, turn_index),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     def get_stats(self) -> dict:
         """Aggregate stats across all sessions — useful for optimization analysis."""
-        cur = self._conn.execute("""
-            SELECT
-                COUNT(DISTINCT session_id)                                 AS sessions,
-                COUNT(*) FILTER (WHERE event_type = 'human')               AS human_turns,
-                COUNT(*) FILTER (WHERE event_type = 'tool_call')           AS tool_calls_total,
-                COUNT(*) FILTER (WHERE tool_name = 'clickhouse_query')     AS ch_queries,
-                COUNT(*) FILTER (WHERE tool_name = 'python_analysis')      AS py_analyses,
-                COUNT(*) FILTER (WHERE tool_name = 'list_tables')          AS list_tables_calls,
-                AVG(token_est) FILTER (WHERE event_type = 'tool_result'
-                    AND tool_name = 'clickhouse_query')                    AS avg_ch_result_tokens,
-                AVG(token_est) FILTER (WHERE event_type = 'tool_result'
-                    AND tool_name = 'python_analysis')                     AS avg_py_result_tokens,
-                SUM(token_est)                                             AS total_tokens_est
-            FROM agent_logs
-        """)
-        cols = [d[0] for d in cur.description]
-        row = cur.fetchone()
-        return dict(zip(cols, row))
+        with self._lock:
+            cur = self._conn.execute("""
+                SELECT
+                    COUNT(DISTINCT session_id)                                 AS sessions,
+                    COUNT(*) FILTER (WHERE event_type = 'human')               AS human_turns,
+                    COUNT(*) FILTER (WHERE event_type = 'tool_call')           AS tool_calls_total,
+                    COUNT(*) FILTER (WHERE tool_name = 'clickhouse_query')     AS ch_queries,
+                    COUNT(*) FILTER (WHERE tool_name = 'python_analysis')      AS py_analyses,
+                    COUNT(*) FILTER (WHERE tool_name = 'list_tables')          AS list_tables_calls,
+                    AVG(token_est) FILTER (WHERE event_type = 'tool_result'
+                        AND tool_name = 'clickhouse_query')                    AS avg_ch_result_tokens,
+                    AVG(token_est) FILTER (WHERE event_type = 'tool_result'
+                        AND tool_name = 'python_analysis')                     AS avg_py_result_tokens,
+                    SUM(token_est)                                             AS total_tokens_est
+                FROM agent_logs
+            """)
+            cols = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            return dict(zip(cols, row))
 
     # ── Internal ──────────────────────────────────────────────────────────────
 

@@ -299,35 +299,47 @@ _orig_pd_to_parquet = pd.DataFrame.to_parquet
 def _virtual_to_parquet(self, path=None, *args, **kwargs):
     """
     Map `/parquet/<file>` → `<session.parquet_dir>/<file>` before writing,
-    and refuse any absolute write path that doesn't resolve under TEMP_DIR.
+    and refuse any write path that doesn't resolve under TEMP_DIR.
 
-    Without the absolute-path check the AST sandbox is bypassable: even with
-    `__import__('os')` blocked, agent code could still call
-    `df.to_parquet('/etc/cron.daily/x')` via pyarrow's filesystem layer and
-    drop a file outside the data area.
+    Both the virtual `/parquet/<...>` namespace and any absolute or relative
+    path are checked: a `..`-shaped suffix (e.g. `/parquet/../../etc/x.parquet`,
+    `../../tmp/x.parquet`) would otherwise bypass the AST sandbox via
+    pyarrow's filesystem layer and drop a file outside the data area.
     """
+    from pathlib import Path as _Path
+    from config import TEMP_DIR as _TEMP_DIR
+    temp_root = _Path(_TEMP_DIR).resolve()
+
     if isinstance(path, str):
         if path.startswith("/parquet/"):
             try:
                 from core.session_context import get_current_session
                 sess = get_current_session()
                 if sess is not None:
-                    target_dir = sess.parquet_dir  # auto-creates if missing
-                    path = str(target_dir / path[len("/parquet/"):])
+                    target_dir = _Path(sess.parquet_dir).resolve()
+                    suffix = path[len("/parquet/"):]
+                    candidate = (target_dir / suffix).resolve()
+                    try:
+                        candidate.relative_to(target_dir)
+                    except ValueError:
+                        raise PermissionError(
+                            f"Sandbox: parquet path escapes session dir: {path}"
+                        )
+                    path = str(candidate)
+            except PermissionError:
+                raise
             except Exception:
                 pass  # fall through, original error will surface
         else:
-            from pathlib import Path as _Path
             p = _Path(path)
-            if p.is_absolute():
-                from config import TEMP_DIR as _TEMP_DIR
-                temp_root = _Path(_TEMP_DIR).resolve()
-                try:
-                    p.resolve().relative_to(temp_root)
-                except ValueError:
-                    raise PermissionError(
-                        f"Sandbox: writing parquet outside TEMP_DIR is not allowed: {path}"
-                    )
+            # Both absolute and relative paths are resolved (relative paths
+            # become absolute against cwd) and must end up under TEMP_DIR.
+            try:
+                p.resolve().relative_to(temp_root)
+            except ValueError:
+                raise PermissionError(
+                    f"Sandbox: writing parquet outside TEMP_DIR is not allowed: {path}"
+                )
     return _orig_pd_to_parquet(self, path, *args, **kwargs)
 
 
@@ -433,6 +445,24 @@ class PythonSandbox:
             return self._execute_locked(code, parquet_path)
 
     def _execute_locked(self, code: str, parquet_path: str) -> dict:
+
+        # ── Reject reads outside TEMP_DIR ─────────────────────────────────
+        # parquet_path comes from the LLM (clickhouse_query result, or written
+        # by previous python_analysis). Pin it to TEMP_DIR so a hostile prompt
+        # can't trick the sandbox into reading `/etc/hosts` or other
+        # filesystem secrets through pyarrow's read_parquet path.
+        try:
+            from pathlib import Path as _Path
+            from config import TEMP_DIR as _TEMP_DIR
+            _Path(parquet_path).resolve().relative_to(_Path(_TEMP_DIR).resolve())
+        except ValueError:
+            return {
+                "success": False,
+                "output": "",
+                "result": None,
+                "plots": [],
+                "error": f"Sandbox: parquet_path must be under TEMP_DIR: {parquet_path}",
+            }
 
         # ── Load data from Parquet (with coercions applied by _safe_read_parquet) ─
         try:

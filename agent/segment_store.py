@@ -69,7 +69,52 @@ class SegmentStore:
                 CREATE INDEX IF NOT EXISTS idx_segments_owner
                     ON segments(owner);
             """)
+            # Mapping table that lets the API answer "does this user own this
+            # segmentation chat session?" without scanning langgraph checkpoints.
+            self._conn.executescript("""
+                CREATE TABLE IF NOT EXISTS segment_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    owner      TEXT NOT NULL DEFAULT '__shared__',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_segment_sessions_owner
+                    ON segment_sessions(owner);
+            """)
             self._conn.commit()
+
+    def record_session_owner(self, session_id: str, owner: str = _SHARED_OWNER) -> None:
+        """First call wins: subsequent calls with a different owner are ignored.
+
+        We INSERT OR IGNORE so the binding is stable even if the same client
+        retries the very first message; a hostile client cannot retroactively
+        rewrite ownership of someone else's session.
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO segment_sessions (session_id, owner, created_at) "
+                "VALUES (?,?,?)",
+                (session_id, owner, now),
+            )
+            self._conn.commit()
+
+    def session_owned_by(self, session_id: str, owner: str) -> bool:
+        """True iff `owner` matches the recorded owner for `session_id`.
+
+        Sessions that predate this table (no row) are treated as shared:
+        only `_SHARED_OWNER` can read them. This preserves backward compat
+        for anonymous-only deployments without weakening per-user isolation.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT owner FROM segment_sessions WHERE session_id = ?",
+                (session_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return owner == _SHARED_OWNER
+        return row["owner"] == owner
 
     def save(self, segment: dict, owner: str = _SHARED_OWNER) -> dict:
         """Сохранить или обновить сегмент. Возвращает сохранённый объект."""

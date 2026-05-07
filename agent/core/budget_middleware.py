@@ -5,22 +5,23 @@ BudgetMiddleware — глобальный счётчик tool-итераций (
 задачу (main + все вложенные task() вызовы).
 
 Mechanism:
-  - Per-thread счётчик в модульной переменной (thread_id → int).
-  - before_model: если счётчик уже >= лимита — добавляем в state
-    HumanMessage с "⛔ ЛИМИТ ИСЧЕРПАН", запрещаем новые tool_calls.
-  - after_model: видим сколько tool_calls планирует модель, инкрементим
-    будущий расход (чтобы вовремя предупредить).
+  - Счётчик ToolMessages в state["messages"] начиная с последнего HumanMessage
+    (current user turn) — так учитываются и main-итерации, и subagent-итерации
+    (subagent в deepagents ходит как обычный tool, его внутренние вызовы видны
+    как ToolMessages после возврата task-tool).
+  - wrap_model_call (предкол): подмешиваем в request HumanMessage-уведомление
+    о приближающемся лимите. Текст статичен в пределах "уровня" (>10 / 6..10 /
+    3..5 / 1..2 / 0), чтобы не ломать prefix-cache.
+  - wrap_model_call (постхук): когда лимит исчерпан, физически вырезаем
+    `tool_calls` из ответа модели. Без этого hard-stop модель может проигнорить
+    мягкое предупреждение и продолжить вызывать инструменты до GraphRecursionError.
 
 Мягкие предупреждения через инъекцию комментария в system_message'а:
   - осталось > 10 → ничего
   - остолось 6..10 → "⚡ 6 итераций" (легкий hint)
   - осталось 3..5 → "⚠ Мало итераций, объединяй запросы"
   - осталось 1..2 → "🚨 Почти исчерпан — последняя возможность"
-  - осталось 0   → "⛔ ЛИМИТ. Дай финальный ответ без инструментов"
-
-Счётчик инкрементится по ToolMessages в state["messages"] — так учитываются
-И main-итерации, И subagent-итерации (subagent в deepagents ходит как обычный
-tool, его внутренние вызовы видны как ToolMessages после task-tool возвращения).
+  - осталось 0   → "⛔ ЛИМИТ. tool_calls стрипаются физически.
 
 Актуально: 30 total по умолчанию (конфигурируется через env).
 """
@@ -111,9 +112,41 @@ def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None
     print(f"[BudgetMiddleware] used={used}/{budget} remaining={remaining} → notice appended")
 
 
+def _strip_tool_calls_if_exhausted(response: Any, used: int, budget: int) -> Any:
+    """If budget is fully spent, remove any pending tool_calls from the model
+    response so the agent loop terminates with whatever the model produced
+    instead of looping until LangGraph's recursion_limit blows up.
+    """
+    if used < budget:
+        return response
+    # Response shape from langchain agents: usually an AIMessage instance, but
+    # can also be a dict {"messages": [AIMessage, ...]} depending on handler.
+    def _clear(msg):
+        # langchain AIMessage uses both `tool_calls` and `additional_kwargs` to
+        # carry calls in different transports; clear both.
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            try:
+                msg.tool_calls = []
+            except Exception:
+                pass
+        try:
+            ak = getattr(msg, "additional_kwargs", None)
+            if isinstance(ak, dict) and "tool_calls" in ak:
+                ak.pop("tool_calls", None)
+        except Exception:
+            pass
+        return msg
+
+    if isinstance(response, dict) and "messages" in response:
+        response["messages"] = [_clear(m) for m in response["messages"]]
+        return response
+    return _clear(response)
+
+
 class BudgetMiddleware(AgentMiddleware):
     """
-    Attach a budget notice to the system prompt when close to the iteration limit.
+    Attach a budget notice to the system prompt when close to the iteration limit
+    and hard-stop new tool_calls once the budget is exhausted.
     """
 
     def __init__(self, max_iterations: int = _DEFAULT_BUDGET) -> None:
@@ -123,9 +156,11 @@ class BudgetMiddleware(AgentMiddleware):
     def wrap_model_call(self, request: ModelRequest, handler):
         used = _count_tool_calls(request.state) if request.state else 0
         _append_budget_notice(request, used, self.max_iterations)
-        return handler(request)
+        response = handler(request)
+        return _strip_tool_calls_if_exhausted(response, used, self.max_iterations)
 
     async def awrap_model_call(self, request: ModelRequest, handler):
         used = _count_tool_calls(request.state) if request.state else 0
         _append_budget_notice(request, used, self.max_iterations)
-        return await handler(request)
+        response = await handler(request)
+        return _strip_tool_calls_if_exhausted(response, used, self.max_iterations)

@@ -59,8 +59,18 @@ def analyze_deepagents(
     # ── Set up per-session context (parquet/plots dirs) ──────────────────
     sess_ctx = make_session_context(session_id=session_id, client_id=client_id)
 
-    # LangGraph thread_id == session_id — guarantees separate memory per chat
-    config = {"configurable": {"thread_id": session_id}}
+    # LangGraph thread_id == session_id — guarantees separate memory per chat.
+    # recursion_limit must outrun BudgetMiddleware: with the default LangGraph
+    # cap of 25 and a budget of MAX_AGENT_ITERATIONS (e.g. 30), the graph
+    # would raise GraphRecursionError before BudgetMiddleware got a chance
+    # to inject its graceful "stop here" message. Multiplying by 2 + headroom
+    # accounts for tool-call rounds counting as multiple node visits.
+    import os as _os
+    _budget = int(_os.environ.get("MAX_AGENT_ITERATIONS", "30"))
+    config = {
+        "configurable": {"thread_id": session_id},
+        "recursion_limit": _budget * 2 + 10,
+    }
 
     try:
         with set_current_session(sess_ctx):
