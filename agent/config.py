@@ -74,7 +74,10 @@ TEMP_DIR.mkdir(exist_ok=True)
 DB_PATH: str = str(BASE_DIR / "chat_history.db")
 
 # ─── Limits ───────────────────────────────────────────────────────────────────
-MAX_AGENT_ITERATIONS: int = int(os.environ.get("MAX_AGENT_ITERATIONS", "15"))
+# Default 30 matches the value used by the deepagents pipeline
+# (core/agent_factory + budget_middleware + api_adapter); raising the legacy
+# default keeps both branches in sync when MAX_AGENT_ITERATIONS env is unset.
+MAX_AGENT_ITERATIONS: int = int(os.environ.get("MAX_AGENT_ITERATIONS", "30"))
 TEMP_FILE_TTL_SECONDS: int = int(os.environ.get("TEMP_FILE_TTL_SECONDS", "3600"))  # 1 hour
 # How many past HumanMessage turns to keep in context (sliding window).
 # Older turns are dropped; current turn is always kept in full.

@@ -127,13 +127,24 @@ def _strip_tool_calls_if_exhausted(response: Any, used: int, budget: int) -> Any
     if used < budget:
         return response
 
+    _BUDGET_EXHAUSTED_NOTICE = (
+        "⛔ Лимит итераций исчерпан. Ниже — сводка по уже собранным данным."
+    )
+
     def _clear_msg(msg):
         """Clear tool_calls on an individual message (best-effort across the
-        AIMessage / pydantic / langchain-core variations)."""
+        AIMessage / pydantic / langchain-core variations).
+
+        If the message ends up with no `content` either (model planned only
+        tool calls, no text), inject a placeholder so the user sees a
+        definitive "limit reached" string instead of an empty bubble.
+        """
+        had_calls = False
         # Direct attribute (AIMessage in langchain-core)
         try:
             if getattr(msg, "tool_calls", None):
                 msg.tool_calls = []
+                had_calls = True
         except Exception:
             pass
         # additional_kwargs.tool_calls (OpenAI transport)
@@ -141,8 +152,27 @@ def _strip_tool_calls_if_exhausted(response: Any, used: int, budget: int) -> Any
             ak = getattr(msg, "additional_kwargs", None)
             if isinstance(ak, dict) and "tool_calls" in ak:
                 ak.pop("tool_calls", None)
+                had_calls = True
         except Exception:
             pass
+        # If we stripped calls AND the message has no displayable text,
+        # backfill content so api_adapter._extract_final_text returns
+        # something user-visible.
+        if had_calls:
+            try:
+                content = getattr(msg, "content", None)
+                empty = (
+                    content is None
+                    or (isinstance(content, str) and not content.strip())
+                    or (isinstance(content, list) and not any(
+                        isinstance(b, dict) and (b.get("text") or "").strip()
+                        for b in content
+                    ))
+                )
+                if empty:
+                    msg.content = _BUDGET_EXHAUSTED_NOTICE
+            except Exception:
+                pass
         return msg
 
     def _clear_list(messages):

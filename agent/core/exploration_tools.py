@@ -25,6 +25,13 @@ from langchain_core.tools import tool
 
 from .schema_cache import get_schema_cache
 
+# Database name — sourced from config (env CLICKHOUSE_DATABASE), so tenants
+# that aren't called "magnetto" don't get a hard-coded prefix in every SQL.
+try:
+    from config import CLICKHOUSE_DATABASE as _CH_DB
+except Exception:  # pragma: no cover - fallback for tests
+    _CH_DB = "magnetto"
+
 
 _MAX_N = 20
 _CELL_MAX_CHARS = 200
@@ -43,12 +50,12 @@ def _pick_date_filter(table_name: str) -> tuple[str, str]:
     # Snapshot-like (приоритет report_date над snapshot_date — у нас чаще так)
     if "report_date" in col_names:
         return (
-            f"WHERE report_date = (SELECT max(report_date) FROM magnetto.{table_name})",
+            f"WHERE report_date = (SELECT max(report_date) FROM {_CH_DB}.{table_name})",
             "ORDER BY report_date DESC",
         )
     if "snapshot_date" in col_names:
         return (
-            f"WHERE snapshot_date = (SELECT max(snapshot_date) FROM magnetto.{table_name})",
+            f"WHERE snapshot_date = (SELECT max(snapshot_date) FROM {_CH_DB}.{table_name})",
             "",
         )
     # Transactional
@@ -126,14 +133,20 @@ def make_sample_table_tool(allowed_tables: Iterable[str]):
 
         n = max(1, min(int(n), _MAX_N))
         where, order = _pick_date_filter(table_name)
-        sql = f"SELECT * FROM magnetto.{table_name} {where} {order} LIMIT {n}".strip()
+        sql = f"SELECT * FROM {_CH_DB}.{table_name} {where} {order} LIMIT {n}".strip()
         # Collapse double spaces from empty where/order
         sql = " ".join(sql.split())
 
         try:
-            from tools import _get_ch_client  # lazy to avoid import cycles
+            from tools import _get_ch_client, _ch_lock  # lazy to avoid import cycles
             ch = _get_ch_client()
-            result = ch.execute_query(sql)
+            # Acquire the same lock clickhouse_query and the API endpoints use
+            # — without it, parallel sample_table calls (or one sample_table
+            # racing a clickhouse_query) interleave on the single
+            # clickhouse_connect HTTP session and trigger
+            # "Attempt to execute concurrent queries within the same session".
+            with _ch_lock:
+                result = ch.execute_query(sql)
             if not result.get("success"):
                 return f"⚠ sample_table: ClickHouse error — {result.get('error', 'unknown')}. SQL: `{sql}`"
 

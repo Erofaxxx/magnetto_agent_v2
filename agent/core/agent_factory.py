@@ -38,7 +38,7 @@ from .schema_cache import get_schema_cache
 from .session_backend import make_backend_factory
 from .subagent_loader import load_subagents
 from .tool_exclusion_middleware import ToolExclusionMiddleware
-from .tools import clickhouse_query, list_tables, python_analysis, think_tool
+from .tools import clickhouse_query, python_analysis, think_tool
 
 
 # ─── Config (from env, with fallbacks mirroring legacy config.py) ───────────

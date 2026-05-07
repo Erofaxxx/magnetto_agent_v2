@@ -118,5 +118,12 @@ def _extract_session_id(runtime) -> str:
     if sc is not None:
         return sc.session_id
 
-    # 4. Fallback — shared scratch namespace
-    return "__shared__"
+    # 4. No source of session_id found. Failing loud is correct here: a
+    # silent "__shared__" fallback would dump multiple users' parquet/plot
+    # files into one directory, breaking isolation. The lifespan/api_adapter
+    # always sets a session id before invoke(), so reaching this branch
+    # signals a real bug.
+    raise RuntimeError(
+        "session_id is required but unset (no runtime context, "
+        "config.configurable.thread_id, or current_session ContextVar)"
+    )

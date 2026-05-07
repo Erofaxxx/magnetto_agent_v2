@@ -48,11 +48,25 @@ _SESSION_ID_RE = _re_mod.compile(r"\A[A-Za-z0-9_-]{8,64}\Z")
 def _validate_session_id(session_id: str) -> str:
     if not _SESSION_ID_RE.match(session_id or ""):
         raise HTTPException(status_code=400, detail="Invalid session_id")
+    # Block reserved internal sentinels (`__shared__`, `__anon__`) which are
+    # alphanumeric+underscore and would otherwise pass the regex — a hostile
+    # client could claim ownership and break the shared/anon slot for others.
+    if session_id in _RESERVED_SESSION_IDS:
+        raise HTTPException(status_code=400, detail="Invalid session_id")
     return session_id
 
 
 _X_USER_ID_RE = _re_mod.compile(r"\A[A-Za-z0-9_.@-]{1,128}\Z")
 _SEGMENT_ID_RE = _re_mod.compile(r"\Aseg_[A-Za-z0-9]{4,32}\Z")
+# job_id is uuid4 (str(uuid.uuid4())); regex is a superset that also covers
+# any legacy-style job_id that might still be in flight after a deploy.
+_JOB_ID_RE = _re_mod.compile(r"\A[A-Za-z0-9-]{8,64}\Z")
+
+
+def _validate_job_id(job_id: str) -> str:
+    if not _JOB_ID_RE.match(job_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid job_id")
+    return job_id
 
 
 def _validate_segment_id(segment_id: str) -> str:
@@ -94,31 +108,63 @@ _running_tasks: set[asyncio.Task] = set()
 # Stored in-process: analytics jobs themselves live in _jobs (also in-memory),
 # so persisting ownership across restarts is unnecessary — when the process
 # dies, the corresponding sessions are gone too.
-_session_owners: dict[str, str] = {}
+# Each entry is (owner, last_touched_ts) so cleanup_loop can drop bindings
+# for sessions that haven't seen a request in SESSION_OWNER_TTL_SECONDS.
+SESSION_OWNER_TTL_SECONDS = int(_os.environ.get("SESSION_OWNER_TTL_SECONDS", "86400"))
+_session_owners: dict[str, tuple[str, float]] = {}
 _session_owners_lock = _threading.Lock()
 _ANON_OWNER = "__anon__"
+# Owner-shaped strings reserved for internal sentinels — reject them as
+# session_ids so a hostile X-User-Id can't grab the shared/anon slot.
+_RESERVED_SESSION_IDS = frozenset({"__shared__", "__anon__"})
 
 
 def _record_analytics_session_owner(session_id: str, owner: str) -> None:
     """First-call-wins binding of a session_id to an owner. Idempotent for
     repeat calls from the same owner; silently skipped for a different owner
     (the original binding stays — equivalent to INSERT OR IGNORE)."""
+    import time
+    now = time.time()
     with _session_owners_lock:
-        _session_owners.setdefault(session_id, owner)
+        existing = _session_owners.get(session_id)
+        if existing is None:
+            _session_owners[session_id] = (owner, now)
+        elif existing[0] == owner:
+            # Refresh TTL on each access by the legitimate owner.
+            _session_owners[session_id] = (owner, now)
 
 
 def _analytics_session_owned_by(session_id: str, owner: str) -> bool:
     """True iff this owner created the session, OR the session has no recorded
     owner yet AND the caller is anonymous (legacy/no-auth deployments)."""
+    import time
     with _session_owners_lock:
-        recorded = _session_owners.get(session_id)
-    if recorded is None:
-        return owner == _ANON_OWNER
-    return recorded == owner
+        record = _session_owners.get(session_id)
+        if record is None:
+            return owner == _ANON_OWNER
+        recorded_owner, _ = record
+        if recorded_owner == owner:
+            # Touch on read so the entry stays alive while in active use.
+            _session_owners[session_id] = (owner, time.time())
+            return True
+        return False
+
+
+def _expire_session_owners(now_ts: float) -> int:
+    """Drop entries that haven't been touched within SESSION_OWNER_TTL_SECONDS.
+
+    Called from _cleanup_loop. Returns count removed (for logging).
+    """
+    cutoff = now_ts - SESSION_OWNER_TTL_SECONDS
+    with _session_owners_lock:
+        expired = [sid for sid, (_o, ts) in _session_owners.items() if ts < cutoff]
+        for sid in expired:
+            _session_owners.pop(sid, None)
+    return len(expired)
 
 
 def _require_session_access(session_id: str, x_user_id: Optional[str]) -> None:
-    """Raise 403 if `x_user_id` does not own `session_id`. Treat absent
+    """Raise 404 if `x_user_id` does not own `session_id`. Treat absent
     X-User-Id as the anonymous owner so single-tenant deployments still work
     without per-user headers — but as soon as one client sends X-User-Id, that
     same id must show up to access the same session.
@@ -507,6 +553,14 @@ async def _cleanup_loop() -> None:
                         print(f"[cleanup] Removed {n} expired session file(s)")
                 except Exception as exc:
                     print(f"[cleanup] Session cleanup error: {exc}")
+            # Drop stale ownership records — in-memory dict would otherwise
+            # grow unbounded over server uptime (one entry per session, ~150B).
+            try:
+                n_o = _expire_session_owners(now)
+                if n_o:
+                    print(f"[cleanup] Dropped {n_o} expired session owner(s)")
+            except Exception as exc:
+                print(f"[cleanup] Session-owner cleanup error: {exc}")
         except asyncio.CancelledError:
             # Propagate cancellation so lifespan can await us cleanly.
             raise
@@ -789,6 +843,7 @@ async def get_job(
     When status == "done", text_output, plots, tool_calls are populated.
     `X-User-Id` must match the owner of the underlying session.
     """
+    _validate_job_id(job_id)
     _validate_x_user_id(x_user_id)
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -1357,16 +1412,24 @@ async def get_table_data(
 
 
 _reports_ch_client = None
+_reports_ch_lock = _threading.Lock()
 
 
 def _get_reports_client():
     """
     Singleton CH-клиент с кредами CLICKHOUSE_REPORTS_USER/_PASSWORD.
     Возвращает None, если переменные не заданы или не удалось подключиться.
+
+    Init is guarded by _reports_ch_lock so two concurrent first-callers
+    don't open duplicate clickhouse_connect HTTP sessions and leak the
+    loser.
     """
     global _reports_ch_client
     if _reports_ch_client is not None:
         return _reports_ch_client
+    with _reports_ch_lock:
+        if _reports_ch_client is not None:
+            return _reports_ch_client
 
     import os
     user = (os.environ.get("CLICKHOUSE_REPORTS_USER") or "").strip()
@@ -1416,12 +1479,15 @@ def _reports_query_dicts(sql: str, required: bool = True) -> list[dict]:
                 "CLICKHOUSE_REPORTS_USER / CLICKHOUSE_REPORTS_PASSWORD не заданы в .env"
             )
         return []
-    qr = client.query(sql)
-    cols = list(qr.column_names)
-    return [
-        {cols[i]: _serialize_value(row[i]) for i in range(len(cols))}
-        for row in qr.result_rows
-    ]
+    # Single shared HTTP session — concurrent .query() calls would interleave
+    # and trigger "concurrent queries within the same session" errors.
+    with _reports_ch_lock:
+        qr = client.query(sql)
+        cols = list(qr.column_names)
+        return [
+            {cols[i]: _serialize_value(row[i]) for i in range(len(cols))}
+            for row in qr.result_rows
+        ]
 
 
 def _safe_float(v) -> float:

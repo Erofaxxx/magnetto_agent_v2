@@ -126,7 +126,12 @@ def _save_plots_to_session(plots_b64: list[str], *, hint: str = "") -> list[dict
             "base64": b64,  # keep original for UI artifact
         })
 
-    # Append to /plots/index.md
+    # Append to /plots/index.md.
+    # `hint` originates from agent code (chart_hint=...) which the LLM
+    # composes from prompt-injectable user data; strip newlines and
+    # markdown-control characters so a hostile hint can't break the file
+    # structure or smuggle a fake heading.
+    safe_hint = re.sub(r"[\r\n`|]", " ", (hint or "untitled chart")).strip() or "untitled chart"
     try:
         ctx = get_current_session()
         if ctx is not None:
@@ -136,7 +141,7 @@ def _save_plots_to_session(plots_b64: list[str], *, hint: str = "") -> list[dict
             if not idx_path.exists():
                 lines.append("# Plots Index\n\nСписок графиков, построенных в этой сессии.\n")
             for s in saved:
-                lines.append(f"- `{s['url']}` ({ts}): {hint or 'untitled chart'}")
+                lines.append(f"- `{s['url']}` ({ts}): {safe_hint}")
             with idx_path.open("a", encoding="utf-8") as f:
                 f.write("\n" + "\n".join(lines) + "\n")
     except Exception:
