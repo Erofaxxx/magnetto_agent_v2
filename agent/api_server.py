@@ -40,7 +40,9 @@ from config import ALLOWED_MODELS, HOST, MODEL, PORT, SERVER_URL
 # uuid4 strings are alphanumerics + dashes; we accept the same shape generically
 # so legacy ids still work but reject anything path-traversal-shaped before
 # concatenating into a filesystem path.
-_SESSION_ID_RE = _re_mod.compile(r"^[A-Za-z0-9_-]{8,64}$")
+# `\A...\Z` instead of `^...$` so a trailing `\n` doesn't sneak through
+# (Python's `$` matches *before* a final newline; `\Z` is hard end-of-string).
+_SESSION_ID_RE = _re_mod.compile(r"\A[A-Za-z0-9_-]{8,64}\Z")
 
 
 def _validate_session_id(session_id: str) -> str:
@@ -49,8 +51,8 @@ def _validate_session_id(session_id: str) -> str:
     return session_id
 
 
-_X_USER_ID_RE = _re_mod.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
-_SEGMENT_ID_RE = _re_mod.compile(r"^seg_[A-Za-z0-9]{4,32}$")
+_X_USER_ID_RE = _re_mod.compile(r"\A[A-Za-z0-9_.@-]{1,128}\Z")
+_SEGMENT_ID_RE = _re_mod.compile(r"\Aseg_[A-Za-z0-9]{4,32}\Z")
 
 
 def _validate_segment_id(segment_id: str) -> str:
@@ -85,6 +87,47 @@ def _validate_x_user_id(x_user_id: Optional[str]) -> Optional[str]:
 # (see https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task).
 # We add each job task here and self-remove on completion.
 _running_tasks: set[asyncio.Task] = set()
+
+
+# ─── Analytics-session ownership (in-memory) ─────────────────────────────────
+# Mirrors segment_store.session_owned_by but for the main analytics flow.
+# Stored in-process: analytics jobs themselves live in _jobs (also in-memory),
+# so persisting ownership across restarts is unnecessary — when the process
+# dies, the corresponding sessions are gone too.
+_session_owners: dict[str, str] = {}
+_session_owners_lock = _threading.Lock()
+_ANON_OWNER = "__anon__"
+
+
+def _record_analytics_session_owner(session_id: str, owner: str) -> None:
+    """First-call-wins binding of a session_id to an owner. Idempotent for
+    repeat calls from the same owner; silently skipped for a different owner
+    (the original binding stays — equivalent to INSERT OR IGNORE)."""
+    with _session_owners_lock:
+        _session_owners.setdefault(session_id, owner)
+
+
+def _analytics_session_owned_by(session_id: str, owner: str) -> bool:
+    """True iff this owner created the session, OR the session has no recorded
+    owner yet AND the caller is anonymous (legacy/no-auth deployments)."""
+    with _session_owners_lock:
+        recorded = _session_owners.get(session_id)
+    if recorded is None:
+        return owner == _ANON_OWNER
+    return recorded == owner
+
+
+def _require_session_access(session_id: str, x_user_id: Optional[str]) -> None:
+    """Raise 403 if `x_user_id` does not own `session_id`. Treat absent
+    X-User-Id as the anonymous owner so single-tenant deployments still work
+    without per-user headers — but as soon as one client sends X-User-Id, that
+    same id must show up to access the same session.
+    """
+    owner = x_user_id or _ANON_OWNER
+    if not _analytics_session_owned_by(session_id, owner):
+        # Mask presence: same 404 whether the session is owned by someone else
+        # or doesn't exist at all.
+        raise HTTPException(status_code=404, detail="Session not found")
 
 
 def _ch_query_locked(ch, sql: str):
@@ -149,12 +192,13 @@ async def _lifespan(app: FastAPI):
         # thread keeps running until it finishes naturally (Python can't
         # cancel threads), but the event loop is no longer blocked on it.
         cleanup_task.cancel()
-        for t in list(_running_tasks):
+        in_flight = list(_running_tasks)
+        for t in in_flight:
             t.cancel()
-        try:
-            await cleanup_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        # Await everything to let CancelledError propagate cleanly. Without
+        # this the lifespan returns before pending cancellations finish, and
+        # uvicorn destroys the loop while tasks are still in cancellation.
+        await asyncio.gather(cleanup_task, *in_flight, return_exceptions=True)
 
 
 # ─── App ──────────────────────────────────────────────────────────────────────
@@ -476,7 +520,11 @@ async def _cleanup_loop() -> None:
 # using the virtual path (/plots/..., /parquet/...). Only when USE_DEEPAGENTS=1.
 
 @app.get("/api/session/{session_id}/file", summary="Download a file from session directory")
-async def get_session_file(session_id: str, path: str):
+async def get_session_file(
+    session_id: str,
+    path: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
     """
     Serve a file from the session's virtual filesystem.
     Path must start with /plots/ or /parquet/ (prevents arbitrary FS access).
@@ -487,6 +535,8 @@ async def get_session_file(session_id: str, path: str):
     if not _USE_DEEPAGENTS:
         raise HTTPException(status_code=400, detail="Files endpoint only available with USE_DEEPAGENTS=1")
     _validate_session_id(session_id)
+    _validate_x_user_id(x_user_id)
+    _require_session_access(session_id, x_user_id)
     if not path.startswith(("/plots/", "/parquet/", "/memories/")):
         raise HTTPException(status_code=400, detail="Path must start with /plots/, /parquet/, or /memories/")
     import re
@@ -516,6 +566,7 @@ async def get_session_parquet(
     path: str,
     offset: int = 0,
     limit: int = 100,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ):
     """
     Read a parquet file from the session's virtual filesystem and return
@@ -531,6 +582,8 @@ async def get_session_parquet(
     if not _USE_DEEPAGENTS:
         raise HTTPException(status_code=400, detail="Parquet endpoint only available with USE_DEEPAGENTS=1")
     _validate_session_id(session_id)
+    _validate_x_user_id(x_user_id)
+    _require_session_access(session_id, x_user_id)
     if not path.startswith("/parquet/"):
         raise HTTPException(status_code=400, detail="Path must start with /parquet/")
     import re as _re
@@ -586,11 +639,16 @@ async def get_session_parquet(
 
 
 @app.get("/api/session/{session_id}/files", summary="List files in session directory")
-async def list_session_files(session_id: str):
+async def list_session_files(
+    session_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
     """List all files (plots + parquet + memories) created in this session."""
     if not _USE_DEEPAGENTS:
         raise HTTPException(status_code=400, detail="Files endpoint only available with USE_DEEPAGENTS=1")
     _validate_session_id(session_id)
+    _validate_x_user_id(x_user_id)
+    _require_session_access(session_id, x_user_id)
     from config import TEMP_DIR
     import pathlib
     session_root = pathlib.Path(TEMP_DIR) / "sessions" / session_id
@@ -652,8 +710,13 @@ async def new_session():
         "message": "New session created",
     }
 @app.get("/api/session/{session_id}", summary="Get session metadata")
-async def get_session(session_id: str):
+async def get_session(
+    session_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
     _validate_session_id(session_id)
+    _validate_x_user_id(x_user_id)
+    _require_session_access(session_id, x_user_id)
     # Snapshot under the lock so cleanup_loop's pop() can't trigger
     # `dictionary changed size during iteration` while we filter.
     with _jobs_lock:
@@ -667,19 +730,26 @@ async def get_session(session_id: str):
     }
 # ─── Main: submit query ────────────────────────────────────────────────────────
 @app.post("/api/analyze", response_model=SubmitResponse, summary="Submit an analytics query")
-async def analyze(req: AnalyzeRequest):
+async def analyze(
+    req: AnalyzeRequest,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
     """
     Submit a query to the agent.
     Returns job_id immediately — agent runs in background.
     Poll GET /api/job/{job_id} to get the result.
 
     Optional `model` field selects the LLM. See GET /api/models for allowed values.
+    `X-User-Id` (optional): isolates session ownership across tenants. Without it
+    the session is bound to an anonymous owner and any subsequent X-User-Id
+    request to the same session_id is rejected.
     """
     if req.model and req.model not in ALLOWED_MODELS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model '{req.model}'. Allowed: {list(ALLOWED_MODELS.keys())}",
         )
+    _validate_x_user_id(x_user_id)
     # Validate the client-supplied session_id BEFORE it reaches
     # make_session_context() (which calls mkdir(parents=True) on the path
     # `TEMP_DIR/sessions/<session_id>`). Without this, a `..`/path-traversal
@@ -687,6 +757,13 @@ async def analyze(req: AnalyzeRequest):
     if req.session_id:
         _validate_session_id(req.session_id)
     session_id = req.session_id or str(uuid.uuid4())
+    # Bind ownership BEFORE creating the job, then verify — same first-write-wins
+    # pattern as segment chat. Without the verify step a client could write into
+    # someone else's session.
+    owner_repr = x_user_id or _ANON_OWNER
+    _record_analytics_session_owner(session_id, owner_repr)
+    if not _analytics_session_owned_by(session_id, owner_repr):
+        raise HTTPException(status_code=403, detail="Session does not belong to this user")
     job_id = _new_job(session_id=session_id, query=req.query, model=req.model)
     # Fire and forget — keep a strong reference so the event loop doesn't
     # garbage-collect the task mid-flight (bare create_task only stores a
@@ -702,16 +779,22 @@ async def analyze(req: AnalyzeRequest):
     )
 # ─── Poll job status ───────────────────────────────────────────────────────────
 @app.get("/api/job/{job_id}", response_model=JobStatusResponse, summary="Poll job status / get result")
-async def get_job(job_id: str):
+async def get_job(
+    job_id: str,
+    x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
+):
     """
     Poll the status of a submitted job.
     status: "pending" | "running" | "done" | "error"
     When status == "done", text_output, plots, tool_calls are populated.
+    `X-User-Id` must match the owner of the underlying session.
     """
+    _validate_x_user_id(x_user_id)
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found (may have expired)")
+    _require_session_access(job["session_id"], x_user_id)
     resp = JobStatusResponse(
         job_id=job["job_id"],
         session_id=job["session_id"],
@@ -909,9 +992,15 @@ async def segment_chat(
     owner = x_user_id or _SHARED_OWNER
     session_id = req.session_id or str(uuid.uuid4())
     # Bind the session to the current owner on first contact (INSERT OR IGNORE
-    # so subsequent messages can't switch ownership). Required for the
-    # auth check in GET /api/segment/chat/{session_id}/history.
-    await asyncio.to_thread(get_segment_store().record_session_owner, session_id, owner)
+    # so subsequent messages can't switch ownership) AND verify ownership
+    # immediately. Without the second check a hostile B can write a message
+    # into A's session — record_session_owner silently no-ops because A is
+    # already the owner, but agent.chat would still execute against the same
+    # thread_id and pollute A's conversation memory.
+    store = get_segment_store()
+    await asyncio.to_thread(store.record_session_owner, session_id, owner)
+    if not await asyncio.to_thread(store.session_owned_by, session_id, owner):
+        raise HTTPException(status_code=403, detail="Session does not belong to this user")
     agent = get_segment_agent(req.model)
     result = await asyncio.to_thread(agent.chat, req.message, session_id, owner)
     return SegmentChatResponse(
@@ -1054,6 +1143,7 @@ _ALLOWED_ZONE_STATUSES = {"red", "green", "yellow"}
 # whether the list is stale — frontend then knows to warn the user.
 _CABINET_CACHE_TTL = 3600  # 1 час
 _cabinet_cache: dict = {"values": [], "fetched_at": 0.0, "last_error_at": 0.0}
+_cabinet_cache_lock = _threading.Lock()
 
 
 async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
@@ -1083,14 +1173,18 @@ async def _get_available_cabinets(force_refresh: bool = False) -> list[str]:
         if result.get("success"):
             df = _pd.read_parquet(result["parquet_path"])
             cabinets = [str(v) for v in df["cabinet_name"].dropna().tolist()]
-            _cabinet_cache["values"] = cabinets
-            _cabinet_cache["fetched_at"] = now
-            _cabinet_cache["last_error_at"] = 0.0
+            # Update under the lock so a concurrent reader doesn't see
+            # `values` already updated but `fetched_at` still stale.
+            with _cabinet_cache_lock:
+                _cabinet_cache["values"] = cabinets
+                _cabinet_cache["fetched_at"] = now
+                _cabinet_cache["last_error_at"] = 0.0
             return cabinets
     except Exception as exc:
         # Сеть/ClickHouse упал — отдаём последние известные значения,
         # даже если TTL истёк. Пустой список означает "ещё не грузили".
-        _cabinet_cache["last_error_at"] = now
+        with _cabinet_cache_lock:
+            _cabinet_cache["last_error_at"] = now
         print(f"[cabinets] refresh failed (cache stale): {exc}")
 
     return _cabinet_cache["values"]
@@ -1171,7 +1265,7 @@ async def get_table_data(
         # alphanumerics; reject anything outside that shape BEFORE checking
         # the runtime allowlist (which is just a cache and could be empty).
         import re as _re_cab
-        if not _re_cab.match(r"^[A-Za-z0-9_-]+$", cabinet_name):
+        if not _re_cab.fullmatch(r"[A-Za-z0-9_-]+", cabinet_name):
             raise HTTPException(status_code=400, detail="Invalid cabinet_name")
         allowed_cabinets = await _get_available_cabinets()
         if cabinet_name not in allowed_cabinets:
@@ -1350,8 +1444,18 @@ async def get_budget(cabinet_name: Optional[str] = None):
     import re
     from config import CLICKHOUSE_DATABASE as CH_DB
 
-    if cabinet_name is not None and not re.match(r"^[A-Za-z0-9_-]+$", cabinet_name):
+    if cabinet_name is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", cabinet_name):
         raise HTTPException(status_code=400, detail="Invalid cabinet_name")
+    # Plus runtime allowlist: same shape check as /api/tables/{name}, prevents
+    # an unknown cabinet from being interpolated into SQL even with a
+    # well-formed regex match.
+    if cabinet_name is not None:
+        _allowed_cabs = await _get_available_cabinets()
+        if _allowed_cabs and cabinet_name not in _allowed_cabs:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown cabinet '{cabinet_name}'",
+            )
 
     try:
         check_sql = (

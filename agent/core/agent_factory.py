@@ -127,6 +127,19 @@ def build_agent(
     if cache_key in _AGENT_CACHE:
         return _AGENT_CACHE[cache_key]
 
+    # Hold the lock across the entire build so two concurrent first-time
+    # callers don't both spend ~1s constructing an agent (and leaking the
+    # second's SqliteSaver connection / WAL file). Builds happen once per
+    # (client, model) lifetime, so the serialisation cost is negligible.
+    with _AGENT_CACHE_LOCK:
+        if cache_key in _AGENT_CACHE:
+            return _AGENT_CACHE[cache_key]
+        return _build_agent_locked(client_id, model_name, cache_key)
+
+
+def _build_agent_locked(client_id: str, model_name: str, cache_key: tuple) -> object:
+    """Caller MUST hold _AGENT_CACHE_LOCK. Splits the long body out so the
+    public function stays small and the lock scope is unambiguous."""
     client_dir = _CLIENTS_ROOT / client_id
     if not client_dir.exists():
         raise ValueError(f"Unknown client: {client_dir}")
@@ -231,7 +244,7 @@ def build_agent(
         model=llm,
         tools=main_tools,
         # response_format=MainFinalAnswer — структурно ограничивает финальный
-        # текст main'а до 600 chars (Pydantic max_length). Main физически
+        # текст main'а до 1500 chars (Pydantic max_length). Main физически
         # не может выкатить переписку sub'овского ответа. api_adapter
         # извлекает structured_response.text и склеивает с sub.summary.
         response_format=MainFinalAnswer,
@@ -274,13 +287,7 @@ def build_agent(
         checkpointer=checkpointer,
     )
 
-    # Publish under the lock and re-check to avoid two parallel first-time
-    # callers each constructing one agent and overwriting each other in cache.
-    # If another thread won the race, drop our build and return theirs.
-    with _AGENT_CACHE_LOCK:
-        if cache_key in _AGENT_CACHE:
-            return _AGENT_CACHE[cache_key]
-        _AGENT_CACHE[cache_key] = agent
+    _AGENT_CACHE[cache_key] = agent
     print(
         f"✅ deepagents main agent ready | client: {client_id} | model: {model_name} | "
         f"subagents: {len(subagent_specs)} | iter_limit: {_MAX_ITERATIONS}"

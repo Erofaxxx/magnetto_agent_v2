@@ -283,6 +283,24 @@ def _coerce_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _safe_read_parquet(path, *args, **kwargs):
+    """Sandbox-internal pd.read_parquet wrapper.
+
+    The execute() pre-check validates the initial parquet_path argument, but
+    agent code can call pd.read_parquet directly with an arbitrary path; without
+    a guard here, prompt injection like `pd.read_parquet('/etc/hosts')` would
+    bypass the sandbox even though pyarrow would only succeed for valid parquet
+    files (information leak through error messages, or successful read of any
+    other parquet file mounted in the same FS).
+    """
+    if isinstance(path, str):
+        from pathlib import Path as _Path
+        from config import TEMP_DIR as _TEMP_DIR
+        try:
+            _Path(path).resolve().relative_to(_Path(_TEMP_DIR).resolve())
+        except ValueError:
+            raise PermissionError(
+                f"Sandbox: pd.read_parquet target must be under TEMP_DIR: {path}"
+            )
     return _coerce_df(_orig_pd_read_parquet(path, *args, **kwargs))
 
 

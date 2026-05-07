@@ -81,7 +81,7 @@ def analyze_deepagents(
 
         messages: list = result.get("messages", []) if isinstance(result, dict) else []
         # MainFinalAnswer instance из response_format — главный источник
-        # main'овского текста (Pydantic-капнут до 600 chars).
+        # main'овского текста (Pydantic-капнут до 1500 chars).
         structured_response = result.get("structured_response") if isinstance(result, dict) else None
 
         text_output = _extract_final_text(messages, structured_response)
@@ -135,11 +135,11 @@ def _extract_final_text(messages: list, structured_response=None) -> str:
       = sub.summary(s) (программная композиция) + main.text (из MainFinalAnswer).
 
     Источник main'овского текста — `structured_response` (MainFinalAnswer
-    instance), а НЕ AIMessage. Pydantic max_length=600 на поле .text
+    instance), а НЕ AIMessage. Pydantic max_length=1500 на поле .text
     структурно гарантирует что main не выкатит переписку sub'овского ответа.
 
     Если sub_summaries пустой (main отвечал сам без task делегирования) —
-    main.text и есть финал (он же ответ, до 600 chars).
+    main.text и есть финал (он же ответ, до 1500 chars).
 
     Fallback: если structured_response отсутствует (старая версия модели,
     отказ structured-output) — берём текст последнего AIMessage как раньше.

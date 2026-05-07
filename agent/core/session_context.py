@@ -77,17 +77,28 @@ def set_current_session(ctx: SessionContext):
     """
     Install session context for the duration of a with-block.
 
+    The ContextVar is updated lazily inside `__enter__` so a caller that
+    obtains the context manager without entering it (e.g. discards the
+    return value) does NOT leak `ctx` into subsequent unrelated requests.
+
     Usage:
         with set_current_session(ctx):
             agent.invoke(...)
     """
-    token = _CURRENT.set(ctx)
+    class _Scope:
+        def __init__(self_inner):
+            self_inner._token = None
 
-    class _Restore:
-        def __enter__(self_inner): return ctx
-        def __exit__(self_inner, *a): _CURRENT.reset(token)
+        def __enter__(self_inner):
+            self_inner._token = _CURRENT.set(ctx)
+            return ctx
 
-    return _Restore()
+        def __exit__(self_inner, *a):
+            if self_inner._token is not None:
+                _CURRENT.reset(self_inner._token)
+                self_inner._token = None
+
+    return _Scope()
 
 
 def get_current_session() -> SessionContext | None:

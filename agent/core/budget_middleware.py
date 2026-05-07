@@ -16,12 +16,12 @@ Mechanism:
     `tool_calls` из ответа модели. Без этого hard-stop модель может проигнорить
     мягкое предупреждение и продолжить вызывать инструменты до GraphRecursionError.
 
-Мягкие предупреждения через инъекцию комментария в system_message'а:
+Мягкие предупреждения через инъекцию HumanMessage:
   - осталось > 10 → ничего
-  - остолось 6..10 → "⚡ 6 итераций" (легкий hint)
+  - осталось 6..10 → "⚡ 6 итераций" (легкий hint)
   - осталось 3..5 → "⚠ Мало итераций, объединяй запросы"
   - осталось 1..2 → "🚨 Почти исчерпан — последняя возможность"
-  - осталось 0   → "⛔ ЛИМИТ. tool_calls стрипаются физически.
+  - осталось 0   → "⛔ ЛИМИТ" + tool_calls стрипаются из ответа модели физически.
 
 Актуально: 30 total по умолчанию (конфигурируется через env).
 """
@@ -113,22 +113,30 @@ def _append_budget_notice(request: ModelRequest, used: int, budget: int) -> None
 
 
 def _strip_tool_calls_if_exhausted(response: Any, used: int, budget: int) -> Any:
-    """If budget is fully spent, remove any pending tool_calls from the model
+    """If budget is fully spent, remove pending tool_calls from the model
     response so the agent loop terminates with whatever the model produced
     instead of looping until LangGraph's recursion_limit blows up.
+
+    Handles ALL shapes that langchain agents may hand to wrap_model_call:
+      - `ModelResponse(result=list[BaseMessage], structured_response=...)`
+        — the canonical shape in current langchain.agents.factory; this was
+        the case the previous implementation missed entirely.
+      - bare `AIMessage` (older transports)
+      - `dict` with `"messages"` or `"result"` key (state-shaped responses)
     """
     if used < budget:
         return response
-    # Response shape from langchain agents: usually an AIMessage instance, but
-    # can also be a dict {"messages": [AIMessage, ...]} depending on handler.
-    def _clear(msg):
-        # langchain AIMessage uses both `tool_calls` and `additional_kwargs` to
-        # carry calls in different transports; clear both.
-        if hasattr(msg, "tool_calls") and msg.tool_calls:
-            try:
+
+    def _clear_msg(msg):
+        """Clear tool_calls on an individual message (best-effort across the
+        AIMessage / pydantic / langchain-core variations)."""
+        # Direct attribute (AIMessage in langchain-core)
+        try:
+            if getattr(msg, "tool_calls", None):
                 msg.tool_calls = []
-            except Exception:
-                pass
+        except Exception:
+            pass
+        # additional_kwargs.tool_calls (OpenAI transport)
         try:
             ak = getattr(msg, "additional_kwargs", None)
             if isinstance(ak, dict) and "tool_calls" in ak:
@@ -137,10 +145,33 @@ def _strip_tool_calls_if_exhausted(response: Any, used: int, budget: int) -> Any
             pass
         return msg
 
-    if isinstance(response, dict) and "messages" in response:
-        response["messages"] = [_clear(m) for m in response["messages"]]
+    def _clear_list(messages):
+        return [_clear_msg(m) for m in messages]
+
+    # --- ModelResponse (pydantic) -----------------------------------------
+    # ModelResponse exposes `result: list[BaseMessage]`; clear inside.
+    if hasattr(response, "result") and isinstance(getattr(response, "result"), list):
+        new_result = _clear_list(response.result)
+        # Prefer pydantic's immutable update so we return a fresh object.
+        try:
+            return response.model_copy(update={"result": new_result})
+        except Exception:
+            try:
+                response.result = new_result
+            except Exception:
+                pass
+            return response
+
+    # --- dict shapes ------------------------------------------------------
+    if isinstance(response, dict):
+        for key in ("result", "messages"):
+            if key in response and isinstance(response[key], list):
+                response[key] = _clear_list(response[key])
+                return response
         return response
-    return _clear(response)
+
+    # --- bare message -----------------------------------------------------
+    return _clear_msg(response)
 
 
 class BudgetMiddleware(AgentMiddleware):
