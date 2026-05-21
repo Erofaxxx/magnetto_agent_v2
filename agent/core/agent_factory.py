@@ -188,6 +188,38 @@ def build_agent(
         default_model=llm,
         tools=_make_subagent_tools,
     )
+
+    # ── Override deepagents' default `general-purpose` subagent ─────────
+    # deepagents v0.5.3 auto-injects a built-in `general-purpose` subagent
+    # IFF no spec with that name is supplied (see deepagents/graph.py:547):
+    #     if not any(s["name"] == "general-purpose" for s in inline_subagents):
+    #         inline_subagents.insert(0, general_purpose_spec)
+    # The built-in inherits the MAIN agent's tools, which means it has NO
+    # `clickhouse_query` (we intentionally don't give it to main, see
+    # `_make_main_tools` above). When the LLM guesses `subagent_type=
+    # "general-purpose"` by habit, it lands in that broken default and
+    # honestly reports "I don't have clickhouse_query, only sample_table" —
+    # exactly the failure we observed in session 2ea277a3 on 2026-05-21.
+    #
+    # Fix: register an alias spec named `general-purpose` that mirrors our
+    # `generalist` (full-scope ClickHouse access via wildcard schema_tables).
+    # deepagents sees the name is taken and skips its default injection.
+    # As a bonus, model fat-fingering "general-purpose" now lands in the
+    # working agent instead of a broken one.
+    _gen = next((s for s in subagent_specs if s.get("name") == "generalist"), None)
+    if _gen is not None and not any(s.get("name") == "general-purpose" for s in subagent_specs):
+        # Shallow copy is fine: tools/system_prompt/model are immutable from
+        # our perspective; middleware list is replaced (not mutated) below.
+        alias = {**_gen, "name": "general-purpose"}
+        subagent_specs.insert(0, alias)
+    elif _gen is None:
+        print(
+            "⚠ agent_factory: no 'generalist' subagent found in client_dir — "
+            "deepagents will inject its default 'general-purpose' (no "
+            "clickhouse_query). Add a 'generalist' SUBAGENT.md or rename one "
+            "to 'general-purpose' to silence the default."
+        )
+
     # Replace model strings with model instances (pin Anthropic provider +
     # auto-cache в extra_body — см. _build_model).
     #

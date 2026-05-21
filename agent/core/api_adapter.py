@@ -118,18 +118,26 @@ def analyze_deepagents(
 
 def _extract_final_text(messages: list, structured_response=None) -> str:
     """
-    Финал для пользователя:
-      = sub.summary(s) (программная композиция) + main.text (из MainFinalAnswer).
+    Финал для пользователя — программная композиция main.text и sub.summary'ев.
 
-    Источник main'овского текста — `structured_response` (MainFinalAnswer
-    instance), а НЕ AIMessage. Pydantic max_length=600 на поле .text
-    структурно гарантирует что main не выкатит переписку sub'овского ответа.
+    Источник main'овского текста и позиции — `structured_response`
+    (MainFinalAnswer instance), а НЕ AIMessage. Pydantic max_length=1500 на
+    поле .text структурно гарантирует что main не выкатит переписку
+    sub'овского ответа.
+
+    Порядок склейки управляется полем `position` из MainFinalAnswer:
+      - position='intro' (по умолчанию): main.text → sub.summary'и
+        Хорошо для вводных фраз («Принято, делегирую», «Вот данные:»)
+      - position='outro':                sub.summary'и → main.text
+        Хорошо для next-step / синтеза / акцента поверх данных подагента
 
     Если sub_summaries пустой (main отвечал сам без task делегирования) —
-    main.text и есть финал (он же ответ, до 600 chars).
+    main.text и есть финал (position игнорируется).
 
     Fallback: если structured_response отсутствует (старая версия модели,
-    отказ structured-output) — берём текст последнего AIMessage как раньше.
+    отказ structured-output) — берём текст последнего AIMessage и считаем
+    его intro (как раньше — было только intro-семантическое поведение,
+    хотя физический порядок был outro; см. историю выше main.text).
     """
     last_human_idx = _find_last_human_idx(messages)
     turn_msgs = messages[last_human_idx:]
@@ -142,16 +150,25 @@ def _extract_final_text(messages: list, structured_response=None) -> str:
                 sub_summaries.append(s)
 
     main_text = _extract_main_text_from_structured(structured_response)
+    main_position = _extract_main_position_from_structured(structured_response)
     if not main_text:
         # Fallback — структурированный ответ отсутствует, берём AIMessage.
         main_text = _extract_main_ai_text(messages)
+        # Без структуры считаем поведение по умолчанию — intro.
+        main_position = "intro"
 
     if not sub_summaries:
         return main_text
 
-    parts = list(sub_summaries)
-    if main_text:
-        parts.append(main_text)
+    if not main_text:
+        # Подагент(ы) отвечали, main молчит.
+        return "\n\n---\n\n".join(sub_summaries)
+
+    if main_position == "outro":
+        parts = list(sub_summaries) + [main_text]
+    else:
+        # 'intro' (default) — text сверху как вводный комментарий
+        parts = [main_text] + list(sub_summaries)
     return "\n\n---\n\n".join(parts)
 
 
@@ -174,6 +191,29 @@ def _extract_main_text_from_structured(structured_response) -> str:
     except Exception:
         pass
     return ""
+
+
+def _extract_main_position_from_structured(structured_response) -> str:
+    """
+    Извлекаем поле `position` из MainFinalAnswer. Default — 'intro'
+    (вводный коммент сверху, sub.summary снизу). Допустимые значения —
+    'intro' / 'outro', всё прочее трактуется как 'intro'.
+    """
+    if structured_response is None:
+        return "intro"
+    try:
+        pos = None
+        # Pydantic v2 instance
+        if hasattr(structured_response, "position"):
+            pos = getattr(structured_response, "position", None)
+        # Dict-shaped fallback
+        elif isinstance(structured_response, dict):
+            pos = structured_response.get("position")
+        if pos in ("intro", "outro"):
+            return pos
+    except Exception:
+        pass
+    return "intro"
 
 
 def _find_last_human_idx(messages: list) -> int:
