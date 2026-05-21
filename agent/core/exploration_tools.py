@@ -131,9 +131,16 @@ def make_sample_table_tool(allowed_tables: Iterable[str]):
         sql = " ".join(sql.split())
 
         try:
-            from tools import _get_ch_client  # lazy to avoid import cycles
+            # Lazy import to avoid import cycles. _ch_lock serialises access to
+            # the singleton ClickHouse client — that connection does not allow
+            # concurrent queries in the same session. Without the lock, the LLM
+            # firing two sample_table tool calls in the same turn produces the
+            # error "Attempt to execute concurrent queries within the same
+            # session" (observed in session 2ea277a3 on 2026-05-21, T2 S8).
+            from tools import _get_ch_client, _ch_lock
             ch = _get_ch_client()
-            result = ch.execute_query(sql)
+            with _ch_lock:
+                result = ch.execute_query(sql)
             if not result.get("success"):
                 return f"⚠ sample_table: ClickHouse error — {result.get('error', 'unknown')}. SQL: `{sql}`"
 
