@@ -18,6 +18,7 @@ Return dict:
 from __future__ import annotations
 
 import json
+import pathlib
 import traceback as tb
 from typing import Any, Optional
 
@@ -27,6 +28,17 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+
+
+# Plot extraction needs disk access (subagents strip ToolMessage.artifact when
+# returning to main, so we re-read base64 from /plots/ files instead).
+import base64 as _base64
+import os as _os
+import time as _time
+try:
+    from config import TEMP_DIR as _TEMP_DIR
+except ImportError:
+    _TEMP_DIR = "/root/clickhouse_analytics_agent/agent/temp_data"
 
 from .agent_factory import build_agent
 from .session_context import make_session_context, set_current_session
@@ -63,6 +75,7 @@ def analyze_deepagents(
     config = {"configurable": {"thread_id": session_id}}
 
     try:
+        _turn_start_ts = _time.time()
         with set_current_session(sess_ctx):
             result = agent.invoke(
                 {"messages": [HumanMessage(content=query)]},
@@ -75,7 +88,7 @@ def analyze_deepagents(
         structured_response = result.get("structured_response") if isinstance(result, dict) else None
 
         text_output = _extract_final_text(messages, structured_response)
-        plots_b64 = _extract_plots(messages)
+        plots_b64 = _extract_plots(messages, session_id=session_id, turn_start_ts=_turn_start_ts)
         plot_urls = _extract_plot_urls(messages)
         parquet_paths = _extract_parquet_paths(messages)
         tool_calls = _extract_tool_calls(messages)
@@ -296,24 +309,35 @@ def _extract_summary_from_subagent_result(content) -> str:
     return stripped
 
 
-def _extract_plots(messages: list) -> list[str]:
-    """Base64 plots from CURRENT turn (after last HumanMessage)."""
-    last_human_idx = -1
-    for i, msg in enumerate(messages):
-        if isinstance(msg, HumanMessage):
-            last_human_idx = i
-    if last_human_idx < 0:
+def _extract_plots(messages: list, session_id: str = "", turn_start_ts: float = 0.0) -> list[str]:
+    """Read base64-encoded PNGs from session's /plots/ dir for CURRENT turn.
+
+    Deepagents subagents do not propagate ToolMessage.artifact to the main
+    state, so falling back to the disk-side artefacts that python_analysis
+    saves via _save_plots_to_session is the only reliable source.
+    """
+    if not session_id:
         return []
-    plots: list[str] = []
-    for msg in messages[last_human_idx:]:
-        if not isinstance(msg, ToolMessage):
+    plots_dir = pathlib.Path(_TEMP_DIR) / "sessions" / session_id / "plots"
+    if not plots_dir.exists():
+        return []
+    out: list[str] = []
+    for p in sorted(plots_dir.glob("*.png")):
+        try:
+            st = p.stat()
+        except OSError:
             continue
-        if (getattr(msg, "name", "") or "") != "python_analysis":
+        # Skip plots from earlier turns (we only inline freshly-created ones)
+        if turn_start_ts and st.st_mtime < turn_start_ts - 1.0:
             continue
-        artifact = getattr(msg, "artifact", None)
-        if isinstance(artifact, list):
-            plots.extend(artifact)
-    return plots
+        try:
+            with open(p, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        b64 = _base64.b64encode(data).decode("ascii")
+        out.append(f"data:image/png;base64,{b64}")
+    return out
 
 
 def _extract_plot_urls(messages: list) -> list[str]:
