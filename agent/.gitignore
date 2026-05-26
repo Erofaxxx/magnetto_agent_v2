@@ -27,4 +27,9 @@ chat_history.db-wal
 # Additional
 *.bak
 *.bak_*
+*.bak.*
 venv_v2/
+
+# Runtime client data (not source)
+clients/magnetto/conversation_history/
+clients/magnetto/root/
