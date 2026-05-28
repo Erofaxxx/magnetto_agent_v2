@@ -55,7 +55,7 @@ _SYSTEM_PROMPT = """Ты — аналитик оптимизации Яндек�
 class DirectOptimizerAgent(BaseSubAgent):
     """Sub-agent for Yandex Direct campaign optimisation."""
 
-    _SCHEMA_TABLES = ["bad_keywords", "bad_placements", "bad_queries", "dm_direct_performance", "command_center_campaigns"]
+    _SCHEMA_TABLES = ["bad_keywords", "bad_placements", "bad_queries", "dm_direct_performance", "command_center_campaigns", "campaigns_settings", "budget_reallocation"]
 
     def __init__(self, model: str = MODEL) -> None:
         skill_text = self._load_skill_files(_SKILL_FILES)
