@@ -12,7 +12,7 @@ cache_control, поэтому он попадает ВНУТРЬ кэша.
 from __future__ import annotations
 
 from copy import copy
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from zoneinfo import ZoneInfo
@@ -25,12 +25,18 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 
 def _dynamic_block() -> str:
     now = datetime.now(_TZ) if _TZ else datetime.utcnow()
-    today = now.date().isoformat()
+    # Витрины (dm_*, command_center, direct_custom_report) обновляются с суточным
+    # лагом: самые свежие ПОЛНЫЕ данные — за вчера. Поэтому «сегодня» для анализа =
+    # дата последней выгрузки (вчера), а не календарный сегодняшний день.
+    data_date = (now.date() - timedelta(days=1)).isoformat()
     year = now.year
     return (
         "\n\n---\n"
         "## Актуальный контекст даты и налога (жёсткая инструкция)\n\n"
-        f"- **Сегодня: {today}** (Europe/Moscow).\n"
+        f"- **Сегодня: {data_date}** (Europe/Moscow). Это дата последней выгрузки — "
+        "витрины обновляются с суточным лагом, поэтому самая свежая дата с полными "
+        "данными и есть «сейчас». Отсутствие данных за более поздние дни — это лаг "
+        "выгрузки, а не отсутствие активности.\n"
         f"- Любой относительный период без явного года («за март», «в этом месяце», "
         f"«на прошлой неделе», «вчера», «за квартал») — это **{year} год**. "
         "НЕ используй даты из training-data, используй ТОЛЬКО дату выше как единственный "
