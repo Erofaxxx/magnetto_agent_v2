@@ -13,7 +13,7 @@ build_agent(session_id, client_id) — фабрика главного deepagent
     command-center, generalist (≈ замена бывшего custom delegate_to_generalist).
   - Backend: session-scoped CompositeBackend (/parquet/, /plots/, /memories/)
   - Middleware: DynamicContext, Caching (logging only — auto-cache настроен в
-    extra_body модели), Budget, HardcodeDetector, ToolExclusion.
+    extra_body модели), Tool/ModelCallLimit budget, HardcodeDetector, ToolExclusion.
   - Checkpointer: SqliteSaver (как в старом агенте, для истории диалогов)
 """
 from __future__ import annotations
@@ -26,9 +26,9 @@ from typing import Optional
 from deepagents import create_deep_agent
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
 
 from .caching_middleware import CachingMiddleware
-from .budget_middleware import BudgetMiddleware
 from .dynamic_context_middleware import DynamicContextMiddleware
 from .enforcement_middleware import HardcodeDetector
 from .exploration_tools import make_describe_table_tool, make_sample_table_tool
@@ -92,6 +92,27 @@ def _build_model(model_name: str) -> ChatOpenAI:
             "cache_control": {"type": "ephemeral"},
         }
     return ChatOpenAI(**kwargs)
+
+
+def _budget_middleware(soft_tool_calls: int, hard_model_calls: int) -> list:
+    """
+    Cache-safe бюджет итераций (заменяет старый prompt-инжектящий BudgetMiddleware).
+
+    - ToolCallLimitMiddleware(exit_behavior="continue"): когда исчерпаны
+      soft_tool_calls tool-вызовов, дальнейшие блокируются статичным сообщением,
+      и модель пишет финальный ответ из уже собранного.
+    - ModelCallLimitMiddleware(exit_behavior="end"): жёсткий backstop, гарантирует
+      завершение. deepagents ставит recursion_limit=9999 на main и НЕ пробрасывает
+      config в подагентов (bug #1698), поэтому лимит обязан жить в middleware.
+
+    Оба считают счётчики в STATE и не дописывают эскалирующее предупреждение в
+    хвост сообщений каждый ход, поэтому Anthropic prompt-cache префикс растёт до
+    конца цикла (старый BudgetMiddleware замораживал кэш после ~10 итераций).
+    """
+    return [
+        ToolCallLimitMiddleware(run_limit=soft_tool_calls, exit_behavior="continue"),
+        ModelCallLimitMiddleware(run_limit=hard_model_calls, exit_behavior="end"),
+    ]
 
 
 # ─── Singleton cache: one agent per (client_id, model) ────────────────────
@@ -234,15 +255,21 @@ def build_agent(
         # Strip any pre-existing copies to enforce correct order
         existing_mw = [
             m for m in existing_mw
-            if not isinstance(m, (DynamicContextMiddleware, CachingMiddleware, BudgetMiddleware))
+            if not isinstance(m, (DynamicContextMiddleware, CachingMiddleware, ToolCallLimitMiddleware, ModelCallLimitMiddleware))
         ]
-        # ВАЖНО: BudgetMiddleware у каждого подагента — без него subagent может
+        # ВАЖНО: бюджет итераций у каждого подагента — без него subagent может
         # уйти в бесконечный retry-цикл (например, при невалидном structured-output
         # из-за обрезания на max_tokens). Уже было: 351 итерация = $17 за один запрос.
         spec["middleware"] = [
             DynamicContextMiddleware(),
             CachingMiddleware(),
-            BudgetMiddleware(max_iterations=_MAX_SUBAGENT_ITERATIONS),
+            # cache-safe: Tool/ModelCallLimit считают в state, не рвут prompt-кэш;
+            # config в subagent.invoke не пробрасывается (deepagents #1698) → лимит
+            # обязан жить в middleware, не в recursion_limit.
+            *_budget_middleware(
+                soft_tool_calls=_MAX_SUBAGENT_ITERATIONS,
+                hard_model_calls=_MAX_SUBAGENT_ITERATIONS + 5,
+            ),
         ] + existing_mw
 
     # ── Checkpointer (per-process single conn) ──────────────────────────
@@ -286,7 +313,13 @@ def build_agent(
             # больше нечего блокировать.
             DynamicContextMiddleware(),
             CachingMiddleware(),
-            BudgetMiddleware(max_iterations=_MAX_ITERATIONS),
+            # Cache-safe бюджет итераций (см. _budget_middleware): не инжектит
+            # эскалирующее предупреждение в промпт каждый ход → prompt-кэш растёт
+            # до конца цикла. Заменяет старый BudgetMiddleware.
+            *_budget_middleware(
+                soft_tool_calls=_MAX_ITERATIONS,
+                hard_model_calls=_MAX_ITERATIONS + 5,
+            ),
             HardcodeDetector(),      # blocks pd.DataFrame({...: [lits]}) patterns
             # Убираем у main ненужные tools от встроенной FilesystemMiddleware.
             # glob/grep/ls провоцировали fallback-поведение (main искал
